@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1315,13 +1316,48 @@ def detail_xiaolipan(pid: str) -> dict[str, Any]:
 
 # ---------------- 笔趣阁 xiunews（GBK，支持在线阅读 / 下载 TXT） ----------------
 
+# 笔趣阁(jieqi) 的 search.php 需要先访问过首页拿到 PHPSESSID/jieqi cookie 才返回结果，
+# 否则返回空结果表。这里维护一个预热过的共享会话，复用 cookie。
+_xiunews_session: Any = None
+_xiunews_lock = threading.Lock()
+
+
+def _xiunews_warm_session() -> Any:
+    """返回一个已访问过首页、带 cookie 的 curl_cffi 会话；不可用时返回 None。"""
+    global _xiunews_session
+    if not HAS_CFFI:
+        return None
+    with _xiunews_lock:
+        if _xiunews_session is None:
+            sess = cffi_requests.Session(impersonate="chrome124")
+            sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+            try:
+                sess.get(XIUNEWS_BASE + "/", timeout=15)  # 预热：获取 cookie
+            except Exception:
+                pass
+            _xiunews_session = sess
+        return _xiunews_session
+
+
+def _xiunews_fetch(url: str, timeout: int = 15) -> tuple[str, str]:
+    """抓取笔趣阁页面，返回 (gbk 解码后的 html, 最终 url)。优先用带 cookie 的会话。"""
+    sess = _xiunews_warm_session()
+    if sess is not None:
+        resp = sess.get(url, headers={"Referer": XIUNEWS_BASE + "/"}, timeout=timeout)
+        resp.raise_for_status()
+        final = getattr(resp, "url", url) or url
+        return resp.content.decode("gbk", "ignore"), str(final)
+    raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
+    return raw.decode("gbk", "ignore"), url
+
+
 def _xiunews_html(url: str, timeout: int = 15) -> str:
-    return http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout).decode("gbk", "ignore")
+    return _xiunews_fetch(url, timeout=timeout)[0]
 
 
 def search_xiunews(keyword: str) -> list[BookItem]:
     url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword.encode('gbk', 'ignore'))}"
-    html = _xiunews_html(url)
+    html, final_url = _xiunews_fetch(url)
     soup = BeautifulSoup(html, "lxml")
     items: list[BookItem] = []
     seen: set[str] = set()
@@ -1348,6 +1384,19 @@ def search_xiunews(keyword: str) -> list[BookItem]:
         )
         if len(items) >= 30:
             break
+    # 单一匹配时站点会 302 直接跳到书页（/NN_NNNN/），此时表格为空，从最终 url 兜底取书
+    if not items:
+        m = re.search(r"/(\d+_\d+)/?$", final_url or "")
+        if m:
+            bid = m.group(1)
+            h1 = soup.find("h1")
+            title = h1.get_text(strip=True) if h1 else keyword
+            ma = re.search(r"作者[:：]\s*([^<\s]+)", html)
+            author = ma.group(1).strip() if ma else ""
+            items.append(
+                BookItem(source="xiunews", id=bid, title=title, author=author,
+                         url=f"{XIUNEWS_BASE}/{bid}/", kind="read")
+            )
     return items
 
 

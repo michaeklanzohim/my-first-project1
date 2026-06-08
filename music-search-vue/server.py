@@ -1355,13 +1355,32 @@ def _xiunews_html(url: str, timeout: int = 15) -> str:
     return _xiunews_fetch(url, timeout=timeout)[0]
 
 
-def search_xiunews(keyword: str) -> list[BookItem]:
-    url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword.encode('gbk', 'ignore'))}"
-    html, final_url = _xiunews_fetch(url)
+def _xiunews_post(path: str, keyword: str, timeout: int = 15) -> tuple[str, str]:
+    """POST 搜索表单（searchkey 用 GBK 编码），返回 (gbk 解码 html, 最终 url)。"""
+    url = XIUNEWS_BASE + path
+    body = "searchkey=" + urllib.parse.quote(keyword.encode("gbk", "ignore"))
+    headers = {
+        "Referer": XIUNEWS_BASE + "/",
+        "Content-Type": "application/x-www-form-urlencoded; charset=gbk",
+    }
+    sess = _xiunews_warm_session()
+    if sess is not None:
+        resp = sess.post(url, data=body, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content.decode("gbk", "ignore"), str(getattr(resp, "url", url) or url)
+    req = urllib.request.Request(
+        url, data=body.encode("ascii"),
+        headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9", **headers}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("gbk", "ignore"), url
+
+
+def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[BookItem]:
+    """解析笔趣阁搜索结果页：每行含书名链接 /NN_NNNN/ 与作者。"""
     soup = BeautifulSoup(html, "lxml")
     items: list[BookItem] = []
     seen: set[str] = set()
-    # 搜索结果表格：每行含书名链接 /NN_NNNN/ 与作者
     for a in soup.select('a[href*="_"]'):
         href = a.get("href", "")
         m = re.search(r"/(\d+_\d+)/?$", href)
@@ -1398,6 +1417,27 @@ def search_xiunews(keyword: str) -> list[BookItem]:
                          url=f"{XIUNEWS_BASE}/{bid}/", kind="read")
             )
     return items
+
+
+def search_xiunews(keyword: str) -> list[BookItem]:
+    # jieqi 引擎搜索为 POST（searchkey 用 GBK），GET 只返回空表；镜像端点不一，依次尝试 POST，再退回 GET。
+    for path in ("/modules/article/waps.php", "/modules/article/search.php"):
+        try:
+            html, final_url = _xiunews_post(path, keyword)
+        except Exception:
+            continue
+        items = _parse_xiunews_results(html, final_url, keyword)
+        if items:
+            return items
+    try:
+        get_url = (
+            f"{XIUNEWS_BASE}/modules/article/search.php"
+            f"?searchkey={urllib.parse.quote(keyword.encode('gbk', 'ignore'))}"
+        )
+        html, final_url = _xiunews_fetch(get_url)
+        return _parse_xiunews_results(html, final_url, keyword)
+    except Exception:
+        return []
 
 
 def detail_xiunews(bid: str) -> dict[str, Any]:

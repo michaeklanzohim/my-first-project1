@@ -8,6 +8,7 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any, Iterator
 
@@ -236,6 +237,34 @@ def decode_gequ_extra(encoded: str) -> str:
         return ""
 
 
+def fetch_gequhai_cover(song_id: str) -> str:
+    """Lightweight cover lookup: fetch the play page and read window.mp3_cover."""
+    try:
+        html = http_get(
+            f"https://www.gequhai.com/play/{song_id}",
+            referer="https://www.gequhai.com/",
+        )
+        m = re.search(r"window\.mp3_cover\s*=\s*'([^']*)'", html)
+        return m.group(1).strip() if m else ""
+    except Exception:
+        return ""
+
+
+def enrich_gequhai_covers(items: list[SongItem]) -> None:
+    """Fill cover URLs for gequhai results concurrently (covers are not in the list HTML)."""
+    pending = [it for it in items if not it.cover]
+    if not pending:
+        return
+    with ThreadPoolExecutor(max_workers=min(10, len(pending))) as pool:
+        futures = {pool.submit(fetch_gequhai_cover, it.id): it for it in pending}
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                item.cover = future.result() or item.cover
+            except Exception:
+                pass
+
+
 def search_gequhai(keyword: str) -> list[SongItem]:
     url = f"https://www.gequhai.com/s/{urllib.parse.quote(keyword)}"
     html = http_get(url, referer="https://www.gequhai.com/")
@@ -256,7 +285,33 @@ def search_gequhai(keyword: str) -> list[SongItem]:
                 url=f"https://www.gequhai.com/play/{sid}",
             )
         )
-    return items[:30]
+    items = items[:30]
+    enrich_gequhai_covers(items)
+    return items
+
+
+def build_qualities(
+    *,
+    direct_mp3: str = "",
+    flac_pan: str = "",
+    mp3_pan: str = "",
+    generic_pan: str = "",
+) -> list[dict[str, Any]]:
+    """Assemble quality/download tiers, highest quality first.
+
+    kind='direct' -> in-app proxy download; kind='pan' -> open netdisk share link.
+    True lossless is only distributed via netdisk (kuwo gates FLAC behind VIP).
+    """
+    tiers: list[dict[str, Any]] = []
+    if flac_pan:
+        tiers.append({"label": "无损 FLAC（网盘）", "format": "flac", "lossless": True, "kind": "pan", "url": flac_pan})
+    if direct_mp3 and is_direct_audio(direct_mp3):
+        tiers.append({"label": "标准 MP3（直链下载）", "format": "mp3", "lossless": False, "kind": "direct", "url": direct_mp3})
+    if mp3_pan:
+        tiers.append({"label": "标准 MP3（网盘）", "format": "mp3", "lossless": False, "kind": "pan", "url": mp3_pan})
+    if generic_pan and not flac_pan and not mp3_pan:
+        tiers.append({"label": "原盘下载（网盘）", "format": "", "lossless": False, "kind": "pan", "url": generic_pan})
+    return tiers
 
 
 def detail_gequhai(song_id: str) -> dict[str, Any]:
@@ -299,6 +354,7 @@ def detail_gequhai(song_id: str) -> dict[str, Any]:
         "playUrl": play_url,
         "downloadUrl": play_url or pan_url,
         "panUrl": pan_url,
+        "qualities": build_qualities(direct_mp3=play_url, generic_pan=pan_url),
         "pageUrl": page_url,
     }
 
@@ -309,6 +365,7 @@ def search_yyfang(keyword: str) -> list[SongItem]:
     items: list[SongItem] = []
     for m in re.finditer(
         r'href="/music/info\.html\?id=([^"]+)"[\s\S]*?'
+        r'<img[^>]+src="([^"]+)"[\s\S]*?'
         r'<div class="song_info">\s*<div>([^<]+)</div>\s*<div>([^<]+)</div>',
         html,
     ):
@@ -316,8 +373,9 @@ def search_yyfang(keyword: str) -> list[SongItem]:
             SongItem(
                 source="yyfang",
                 id=m.group(1),
-                name=m.group(2).strip(),
-                artist=m.group(3).strip(),
+                name=m.group(3).strip(),
+                artist=m.group(4).strip(),
+                cover=m.group(2).strip(),
                 url=f"https://yyfang.top/music/info.html?id={m.group(1)}",
             )
         )
@@ -338,7 +396,8 @@ def detail_yyfang(song_id: str) -> dict[str, Any]:
     data = parse_yyfang_detail_json(html)
     play_url = data.get("music_mp3Url") or data.get("music_mp3url") or ""
     flac_url = data.get("music_flacUrl") or data.get("music_flacurl") or ""
-    pan_url = data.get("mp3_url") or ""
+    mp3_pan = data.get("mp3_url") or ""
+    flac_pan = data.get("flac_url") or ""
     if play_url:
         play_url = convert_kuwo_url(play_url)
     if flac_url:
@@ -354,9 +413,10 @@ def detail_yyfang(song_id: str) -> dict[str, Any]:
         "artist": data.get("music_artist", ""),
         "cover": data.get("music_cover", ""),
         "playUrl": play_url,
-        "downloadUrl": play_url or flac_url or pan_url,
+        "downloadUrl": play_url or flac_url or mp3_pan,
         "flacUrl": flac_url,
-        "panUrl": pan_url,
+        "panUrl": mp3_pan,
+        "qualities": build_qualities(direct_mp3=play_url, flac_pan=flac_pan, mp3_pan=mp3_pan),
         "pageUrl": page_url,
     }
 
@@ -454,6 +514,7 @@ def detail_fangpi(song_id: str) -> dict[str, Any]:
         "playUrl": play_url,
         "downloadUrl": play_url or pan_url,
         "panUrl": pan_url,
+        "qualities": build_qualities(direct_mp3=play_url, generic_pan=pan_url),
         "lyric": lyric_el.get_text("\n", strip=True) if lyric_el else "",
         "pageUrl": page_url,
     }
@@ -471,16 +532,40 @@ def api_search():
     if not q:
         return jsonify({"error": "请输入搜索关键词"}), 400
 
-    results: list[dict] = []
     fangpi_meta: dict[str, Any] = {}
 
-    if source in ("all", "gequhai"):
-        results.extend(asdict(x) for x in search_gequhai(q))
-    if source in ("all", "yyfang"):
-        results.extend(asdict(x) for x in search_yyfang(q))
-    if source in ("all", "fangpi"):
-        fangpi_items, fangpi_meta = search_fangpi(q)
-        results.extend(asdict(x) for x in fangpi_items)
+    tasks: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        if source in ("all", "gequhai"):
+            tasks["gequhai"] = pool.submit(search_gequhai, q)
+        if source in ("all", "yyfang"):
+            tasks["yyfang"] = pool.submit(search_yyfang, q)
+        if source in ("all", "fangpi"):
+            tasks["fangpi"] = pool.submit(search_fangpi, q)
+
+        gequhai_items: list[SongItem] = []
+        yyfang_items: list[SongItem] = []
+        fangpi_items: list[SongItem] = []
+        if "gequhai" in tasks:
+            try:
+                gequhai_items = tasks["gequhai"].result()
+            except Exception:
+                gequhai_items = []
+        if "yyfang" in tasks:
+            try:
+                yyfang_items = tasks["yyfang"].result()
+            except Exception:
+                yyfang_items = []
+        if "fangpi" in tasks:
+            try:
+                fangpi_items, fangpi_meta = tasks["fangpi"].result()
+            except Exception as exc:
+                fangpi_items, fangpi_meta = [], {"available": False, "message": f"放屁网暂不可用：{exc}"}
+
+    results: list[dict] = []
+    results.extend(asdict(x) for x in gequhai_items)
+    results.extend(asdict(x) for x in yyfang_items)
+    results.extend(asdict(x) for x in fangpi_items)
 
     return jsonify({"query": q, "count": len(results), "items": results, "fangpi": fangpi_meta})
 

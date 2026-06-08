@@ -1141,6 +1141,20 @@ def _book_search_url(site: dict[str, Any], keyword: str) -> str:
     return site["url"]
 
 
+def _title_matches(keyword: str, title: str) -> bool:
+    """关键词相关性过滤：标题需包含关键词（忽略大小写/空格）；多词查询需包含全部词。"""
+    k = (keyword or "").strip().lower()
+    t = (title or "").lower()
+    if not k:
+        return True
+    if re.sub(r"\s+", "", k) in re.sub(r"\s+", "", t):
+        return True
+    tokens = [tok for tok in re.split(r"\s+", k) if tok]
+    if len(tokens) > 1 and all(tok in t for tok in tokens):
+        return True
+    return False
+
+
 # ---------------- Anna's Archive ----------------
 
 def _annas_img(row: Any) -> str:
@@ -1432,6 +1446,10 @@ def api_book_search():
                 results[k] = f.result(timeout=22)
             except Exception:
                 results[k] = []
+
+    # 过滤掉标题与关键词无关的结果（部分源会返回热门/无关书目）
+    for k in results:
+        results[k] = [b for b in results[k] if _title_matches(q, b.title)]
 
     ordered = ["annas", "xiaolipan", "xiunews"]
     items: list[BookItem] = []

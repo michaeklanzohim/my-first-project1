@@ -1035,5 +1035,511 @@ def api_video_stream():
     return Response(content, status=status, content_type=ctype or "application/octet-stream")
 
 
+# ===================== 电子书 (annas-archive / xiaolipan / xiunews + 原站入口) =====================
+
+ANNAS_BASE = "https://zh.annas-archive.gl"
+XIAOLIPAN_BASE = "https://www.xiaolipan.com"
+XIUNEWS_BASE = "http://www.xiunews.com"
+
+# 可服务端抓取（search/detail）的来源 + 仅提供「打开原站」入口的来源。
+# scrapable=True 走聚合搜索；kind=read 支持站内在线阅读，kind=download 仅提供下载/原站。
+BOOK_SOURCES = [
+    {
+        "key": "annas",
+        "name": "安娜的档案 Anna's Archive",
+        "url": ANNAS_BASE + "/",
+        "scrapable": True,
+        "kind": "download",
+        "search": ANNAS_BASE + "/search?q={kw}",
+        "note": "海量电子书检索（PDF/EPUB/MOBI…），下载跳转原站",
+    },
+    {
+        "key": "xiaolipan",
+        "name": "小璃盘",
+        "url": XIAOLIPAN_BASE + "/",
+        "scrapable": True,
+        "kind": "download",
+        "search": XIAOLIPAN_BASE + "/search.html?keyword={kw}",
+        "note": "kindle/PDF/txt/mobi/epub 电子书下载",
+    },
+    {
+        "key": "xiunews",
+        "name": "笔趣阁 xiunews",
+        "url": XIUNEWS_BASE + "/",
+        "scrapable": True,
+        "kind": "read",
+        "search": XIUNEWS_BASE + "/modules/article/search.php?searchkey={kw}",
+        "note": "小说站，支持站内在线阅读 / 下载 TXT（部分 CDN 拦机房 IP，住宅宽带更稳）",
+    },
+    {
+        "key": "dushupai",
+        "name": "读书派 dushupai.com",
+        "url": "https://www.dushupai.com/",
+        "scrapable": False,
+        "note": "Cloudflare 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+    {
+        "key": "feiku6",
+        "name": "飞库 feiku6.com",
+        "url": "https://feiku6.com/",
+        "scrapable": False,
+        "note": "Cloudflare 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+    {
+        "key": "lunarora",
+        "name": "Lunarora lunarora.com",
+        "url": "https://lunarora.com/",
+        "scrapable": False,
+        "note": "Cloudflare 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+    {
+        "key": "shidianguji",
+        "name": "识典古籍 shidianguji.com",
+        "url": "https://www.shidianguji.com/",
+        "scrapable": False,
+        "search": "https://www.shidianguji.com/search?q={kw}",
+        "note": "动态站点 + 反爬，服务器端无法抓取，请打开原站搜索",
+    },
+]
+BOOK_SOURCE_BY_KEY = {s["key"]: s for s in BOOK_SOURCES}
+
+
+@dataclass
+class BookItem:
+    source: str
+    id: str
+    title: str
+    author: str = ""
+    cover: str = ""
+    meta: str = ""
+    ext: str = ""
+    url: str = ""
+    kind: str = "download"
+
+
+def http_get_bytes(url: str, headers: dict | None = None, referer: str | None = None, timeout: int = 20) -> bytes:
+    hdrs = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"}
+    if referer:
+        hdrs["Referer"] = referer
+    if headers:
+        hdrs.update(headers)
+    if HAS_CFFI:
+        resp = cffi_requests.get(url, headers=hdrs, impersonate="chrome124", timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+    req = urllib.request.Request(url, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _book_search_url(site: dict[str, Any], keyword: str) -> str:
+    tpl = site.get("search")
+    if tpl:
+        if site["key"] == "xiunews":
+            return tpl.replace("{kw}", urllib.parse.quote(keyword.encode("gbk", "ignore")))
+        return tpl.replace("{kw}", urllib.parse.quote(keyword))
+    return site["url"]
+
+
+# ---------------- Anna's Archive ----------------
+
+def _annas_img(row: Any) -> str:
+    for img in row.find_all("img"):
+        src = (img.get("data-src") or img.get("src") or "").strip()
+        if src.startswith("http"):
+            return src
+    return ""
+
+
+def search_annas(keyword: str) -> list[BookItem]:
+    html = http_get(f"{ANNAS_BASE}/search?q={urllib.parse.quote(keyword)}", referer=ANNAS_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    items: list[BookItem] = []
+    seen: set[str] = set()
+    for a in soup.select('a[href^="/md5/"]'):
+        href = a.get("href", "")
+        m = re.match(r"^/md5/([0-9a-f]{32})$", href)
+        if not m:
+            continue
+        title = a.get_text(strip=True)
+        if not title:  # cover anchors have no text
+            continue
+        md5 = m.group(1)
+        if md5 in seen:
+            continue
+        seen.add(md5)
+        row = a
+        for _ in range(6):
+            row = row.parent
+            if row is None:
+                break
+            if row.name == "div" and "flex" in (row.get("class") or []):
+                break
+        meta = ""
+        ext = ""
+        cover = ""
+        if row is not None:
+            md = row.find("div", class_=lambda c: c and "text-gray-800" in c)
+            if md:
+                meta = re.sub(r"\s+", " ", md.get_text(" ", strip=True))
+                fm = re.search(r"\b(PDF|EPUB|MOBI|AZW3|TXT|DJVU|CBZ|CBR|FB2)\b", meta, re.I)
+                if fm:
+                    ext = fm.group(1).lower()
+            cover = _annas_img(row)
+        items.append(
+            BookItem(source="annas", id=md5, title=title, cover=cover, meta=meta, ext=ext,
+                     url=f"{ANNAS_BASE}/md5/{md5}", kind="download")
+        )
+        if len(items) >= 30:
+            break
+    return items
+
+
+def detail_annas(md5: str) -> dict[str, Any]:
+    page = f"{ANNAS_BASE}/md5/{md5}"
+    html = http_get(page, referer=ANNAS_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    title = ""
+    if soup.title:
+        title = soup.title.get_text(strip=True)
+        for sep in (" - ", " — ", " | "):
+            if sep in title:
+                title = title.rsplit(sep, 1)[0].strip()
+                break
+    if not title:
+        h = soup.find("h1")
+        title = h.get_text(strip=True) if h else ""
+    img = soup.find("img", src=re.compile(r"^https?://"))
+    cover = img.get("src").strip() if img else ""
+    desc = ""
+    dd = soup.find("div", class_=lambda c: c and "js-md5-top-box-description" in c)
+    if dd:
+        desc = dd.get_text(" ", strip=True)
+    # 下载入口：原站会列出若干镜像 / 慢速下载（多需排队或会员），统一跳转原站下载页
+    downloads = [{"label": "前往安娜的档案下载页（含多镜像/慢速下载）", "url": page, "kind": "page"}]
+    return {
+        "source": "annas",
+        "id": md5,
+        "title": title,
+        "cover": cover,
+        "desc": desc[:600],
+        "pageUrl": page,
+        "kind": "download",
+        "downloads": downloads,
+    }
+
+
+# ---------------- 小璃盘 xiaolipan ----------------
+
+def search_xiaolipan(keyword: str) -> list[BookItem]:
+    url = f"{XIAOLIPAN_BASE}/search.html?keyword={urllib.parse.quote(keyword)}"
+    html = http_get(url, referer=XIAOLIPAN_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    items: list[BookItem] = []
+    seen: set[str] = set()
+    for h in soup.select("h2.entry-title a"):
+        href = h.get("href", "")
+        m = re.search(r"/p/(\d+)\.html", href)
+        if not m:
+            continue
+        pid = m.group(1)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        title = h.get_text(strip=True)
+        art = h.find_parent("article")
+        cover = ""
+        if art:
+            img = art.find("img")
+            if img:
+                cover = (img.get("data-original") or img.get("src") or "").strip()
+        items.append(
+            BookItem(source="xiaolipan", id=pid, title=title, cover=cover,
+                     url=f"{XIAOLIPAN_BASE}/p/{pid}.html", kind="download")
+        )
+        if len(items) >= 30:
+            break
+    return items
+
+
+def detail_xiaolipan(pid: str) -> dict[str, Any]:
+    page = f"{XIAOLIPAN_BASE}/p/{pid}.html"
+    html = http_get(page, referer=XIAOLIPAN_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    title = ""
+    h = soup.find("h1")
+    if h:
+        title = h.get_text(strip=True)
+    if not title:
+        mt = re.search(r'<title>([^<_]+)', html)
+        title = mt.group(1).strip() if mt else ""
+    img = soup.find("meta", property="og:image")
+    cover = img.get("content", "").strip() if img else ""
+    desc = ""
+    dm = soup.find("meta", attrs={"name": "description"})
+    if dm:
+        desc = dm.get("content", "").strip()
+    m = re.search(r'download_url:\s*"([^"]+)"', html)
+    download_url = m.group(1) if m else ""
+    me = re.search(r"enabledDownload:\s*(\w+)", html)
+    enabled = bool(me and me.group(1) == "true")
+    downloads: list[dict[str, str]] = []
+    if download_url and enabled:
+        downloads.append({"label": "前往下载页（kindle/PDF/EPUB/MOBI/TXT）", "url": download_url, "kind": "page"})
+    downloads.append({"label": "打开原站书籍页面", "url": page, "kind": "page"})
+    return {
+        "source": "xiaolipan",
+        "id": pid,
+        "title": title,
+        "cover": cover,
+        "desc": desc[:600],
+        "pageUrl": page,
+        "kind": "download",
+        "downloads": downloads,
+    }
+
+
+# ---------------- 笔趣阁 xiunews（GBK，支持在线阅读 / 下载 TXT） ----------------
+
+def _xiunews_html(url: str, timeout: int = 15) -> str:
+    return http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout).decode("gbk", "ignore")
+
+
+def search_xiunews(keyword: str) -> list[BookItem]:
+    url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword.encode('gbk', 'ignore'))}"
+    html = _xiunews_html(url)
+    soup = BeautifulSoup(html, "lxml")
+    items: list[BookItem] = []
+    seen: set[str] = set()
+    # 搜索结果表格：每行含书名链接 /NN_NNNN/ 与作者
+    for a in soup.select('a[href*="_"]'):
+        href = a.get("href", "")
+        m = re.search(r"/(\d+_\d+)/?$", href)
+        if not m:
+            continue
+        bid = m.group(1)
+        title = a.get_text(strip=True)
+        if not title or bid in seen:
+            continue
+        seen.add(bid)
+        author = ""
+        row = a.find_parent("tr")
+        if row:
+            tds = row.find_all("td")
+            if len(tds) >= 3:
+                author = tds[2].get_text(strip=True)
+        items.append(
+            BookItem(source="xiunews", id=bid, title=title, author=author,
+                     url=f"{XIUNEWS_BASE}/{bid}/", kind="read")
+        )
+        if len(items) >= 30:
+            break
+    return items
+
+
+def detail_xiunews(bid: str) -> dict[str, Any]:
+    page = f"{XIUNEWS_BASE}/{bid}/"
+    html = _xiunews_html(page)
+    soup = BeautifulSoup(html, "lxml")
+    title = ""
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
+    author = ""
+    ma = re.search(r"作者[:：]\s*([^<\s]+)", html)
+    if ma:
+        author = ma.group(1).strip()
+    img = soup.find("meta", property="og:image")
+    cover = img.get("content", "").strip() if img else ""
+    desc = ""
+    dm = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+    if dm:
+        desc = dm.get("content", "").strip()
+    chapters: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for a in soup.select("dd a, .listmain a, #list a"):
+        href = a.get("href", "")
+        m = re.search(rf"/{re.escape(bid)}/(\d+)\.html", href)
+        if not m:
+            continue
+        cid = m.group(1)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        chapters.append({"id": cid, "name": a.get_text(strip=True), "url": f"{XIUNEWS_BASE}/{bid}/{cid}.html"})
+    return {
+        "source": "xiunews",
+        "id": bid,
+        "title": title,
+        "author": author,
+        "cover": cover,
+        "desc": desc[:600],
+        "pageUrl": page,
+        "kind": "read",
+        "chapters": chapters,
+    }
+
+
+def _xiunews_chapter_text(bid: str, cid: str) -> tuple[str, list[str]]:
+    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html")
+    soup = BeautifulSoup(html, "lxml")
+    name = ""
+    h1 = soup.find("h1")
+    if h1:
+        name = h1.get_text(strip=True)
+    content_el = soup.find(id="content") or soup.find("div", class_=re.compile(r"content|showtxt"))
+    paras: list[str] = []
+    if content_el:
+        for tag in content_el.find_all(["script", "style", "div", "a"]):
+            tag.decompose()
+        raw = content_el.get_text("\n", strip=True)
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line or "笔趣" in line and "http" in line:
+                continue
+            paras.append(line)
+    return name, paras
+
+
+def chapter_xiunews(bid: str, cid: str) -> dict[str, Any]:
+    name, paras = _xiunews_chapter_text(bid, cid)
+    return {"source": "xiunews", "book": bid, "id": cid, "name": name, "paragraphs": paras}
+
+
+# ---------------- 电子书路由 ----------------
+
+@app.get("/api/book/sources")
+def api_book_sources():
+    return jsonify({"sources": BOOK_SOURCES})
+
+
+@app.get("/api/book/search")
+def api_book_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "缺少搜索关键词"}), 400
+
+    scrapers = {
+        "annas": (lambda: search_annas(q)),
+        "xiaolipan": (lambda: search_xiaolipan(q)),
+        "xiunews": (lambda: search_xiunews(q)),
+    }
+    results: dict[str, list[BookItem]] = {}
+    with ThreadPoolExecutor(max_workers=len(scrapers)) as pool:
+        futs = {k: pool.submit(fn) for k, fn in scrapers.items()}
+        for k, f in futs.items():
+            try:
+                results[k] = f.result(timeout=22)
+            except Exception:
+                results[k] = []
+
+    ordered = ["annas", "xiaolipan", "xiunews"]
+    items: list[BookItem] = []
+    i = 0
+    while True:
+        added = False
+        for k in ordered:
+            lst = results.get(k, [])
+            if i < len(lst):
+                items.append(lst[i])
+                added = True
+        if not added:
+            break
+        i += 1
+
+    blocked = [
+        {"key": s["key"], "name": s["name"], "url": _book_search_url(s, q), "note": s.get("note", "")}
+        for s in BOOK_SOURCES
+        if not s["scrapable"]
+    ]
+    sources = [{"key": s["key"], "name": s["name"], "kind": s.get("kind", "")} for s in BOOK_SOURCES if s["scrapable"]]
+    return jsonify(
+        {"query": q, "count": len(items), "items": [asdict(x) for x in items], "blocked": blocked, "sources": sources}
+    )
+
+
+@app.get("/api/book/detail")
+def api_book_detail():
+    source = (request.args.get("source") or "").lower()
+    bid = (request.args.get("id") or "").strip()
+    if not source or not bid:
+        return jsonify({"error": "缺少 source 或 id"}), 400
+    try:
+        if source == "annas":
+            return jsonify(detail_annas(bid))
+        if source == "xiaolipan":
+            return jsonify(detail_xiaolipan(bid))
+        if source == "xiunews":
+            return jsonify(detail_xiunews(bid))
+        return jsonify({"error": f"暂不支持来源: {source}"}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/book/chapter")
+def api_book_chapter():
+    source = (request.args.get("source") or "").lower()
+    book = (request.args.get("book") or "").strip()
+    cid = (request.args.get("id") or "").strip()
+    if source != "xiunews":
+        return jsonify({"error": f"该来源不支持站内阅读: {source}"}), 400
+    if not book or not cid:
+        return jsonify({"error": "缺少 book 或 id"}), 400
+    try:
+        return jsonify(chapter_xiunews(book, cid))
+    except Exception as exc:
+        return jsonify({"error": f"章节加载失败: {exc}"}), 502
+
+
+@app.get("/api/book/download")
+def api_book_download():
+    """笔趣阁整本下载：并发抓取各章节文本，拼成 TXT 返回。"""
+    source = (request.args.get("source") or "").lower()
+    book = (request.args.get("id") or "").strip()
+    if source != "xiunews":
+        return jsonify({"error": "该来源请使用原站下载入口"}), 400
+    if not book:
+        return jsonify({"error": "缺少 id"}), 400
+    try:
+        detail = detail_xiunews(book)
+    except Exception as exc:
+        return jsonify({"error": f"获取目录失败: {exc}"}), 502
+    chapters = detail.get("chapters", [])
+    if not chapters:
+        return jsonify({"error": "未找到章节目录"}), 404
+
+    title = detail.get("title") or book
+    author = detail.get("author") or ""
+
+    def fetch(ch: dict[str, Any]) -> tuple[str, str]:
+        try:
+            name, paras = _xiunews_chapter_text(book, ch["id"])
+            return ch["id"], (name or ch["name"]) + "\n\n" + "\n".join(paras) + "\n\n"
+        except Exception:
+            return ch["id"], (ch["name"] or "") + "\n\n（本章加载失败）\n\n"
+
+    order = [c["id"] for c in chapters]
+    texts: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(fetch, c): c["id"] for c in chapters}
+        for fut in as_completed(futs):
+            cid, body = fut.result()
+            texts[cid] = body
+
+    def generate() -> Iterator[bytes]:
+        header = f"{title}\n作者：{author}\n来源：笔趣阁 {XIUNEWS_BASE}/{book}/\n\n"
+        yield header.encode("utf-8")
+        for cid in order:
+            yield texts.get(cid, "").encode("utf-8")
+
+    filename = sanitize_filename(f"{title}-{author}".strip("-")) + ".txt"
+    quoted = urllib.parse.quote(filename)
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}",
+    }
+    return Response(generate(), headers=headers)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5178, debug=True)

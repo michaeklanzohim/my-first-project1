@@ -1136,8 +1136,6 @@ def http_get_bytes(url: str, headers: dict | None = None, referer: str | None = 
 def _book_search_url(site: dict[str, Any], keyword: str) -> str:
     tpl = site.get("search")
     if tpl:
-        if site["key"] == "xiunews":
-            return tpl.replace("{kw}", urllib.parse.quote(keyword.encode("gbk", "ignore")))
         return tpl.replace("{kw}", urllib.parse.quote(keyword))
     return site["url"]
 
@@ -1314,10 +1312,8 @@ def detail_xiaolipan(pid: str) -> dict[str, Any]:
     }
 
 
-# ---------------- 笔趣阁 xiunews（GBK，支持在线阅读 / 下载 TXT） ----------------
+# ---------------- 笔趣阁 xiunews（UTF-8，支持在线阅读 / 下载 TXT） ----------------
 
-# 笔趣阁(jieqi) 的 search.php 需要先访问过首页拿到 PHPSESSID/jieqi cookie 才返回结果，
-# 否则返回空结果表。这里维护一个预热过的共享会话，复用 cookie。
 _xiunews_session: Any = None
 _xiunews_lock = threading.Lock()
 
@@ -1332,48 +1328,35 @@ def _xiunews_warm_session() -> Any:
             sess = cffi_requests.Session(impersonate="chrome124")
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             try:
-                sess.get(XIUNEWS_BASE + "/", timeout=15)  # 预热：获取 cookie
+                sess.get(XIUNEWS_BASE + "/", timeout=15)
             except Exception:
                 pass
             _xiunews_session = sess
         return _xiunews_session
 
 
+def _xiunews_decode(raw: bytes) -> str:
+    """站点页面为 UTF-8；个别旧页可能是 GBK，做自适应解码。"""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("gbk", "ignore")
+
+
 def _xiunews_fetch(url: str, timeout: int = 15) -> tuple[str, str]:
-    """抓取笔趣阁页面，返回 (gbk 解码后的 html, 最终 url)。优先用带 cookie 的会话。"""
+    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。"""
     sess = _xiunews_warm_session()
     if sess is not None:
         resp = sess.get(url, headers={"Referer": XIUNEWS_BASE + "/"}, timeout=timeout)
         resp.raise_for_status()
         final = getattr(resp, "url", url) or url
-        return resp.content.decode("gbk", "ignore"), str(final)
+        return _xiunews_decode(resp.content), str(final)
     raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
-    return raw.decode("gbk", "ignore"), url
+    return _xiunews_decode(raw), url
 
 
 def _xiunews_html(url: str, timeout: int = 15) -> str:
     return _xiunews_fetch(url, timeout=timeout)[0]
-
-
-def _xiunews_post(path: str, keyword: str, timeout: int = 15) -> tuple[str, str]:
-    """POST 搜索表单（searchkey 用 GBK 编码），返回 (gbk 解码 html, 最终 url)。"""
-    url = XIUNEWS_BASE + path
-    body = "searchkey=" + urllib.parse.quote(keyword.encode("gbk", "ignore"))
-    headers = {
-        "Referer": XIUNEWS_BASE + "/",
-        "Content-Type": "application/x-www-form-urlencoded; charset=gbk",
-    }
-    sess = _xiunews_warm_session()
-    if sess is not None:
-        resp = sess.post(url, data=body, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.content.decode("gbk", "ignore"), str(getattr(resp, "url", url) or url)
-    req = urllib.request.Request(
-        url, data=body.encode("ascii"),
-        headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9", **headers}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("gbk", "ignore"), url
 
 
 def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[BookItem]:
@@ -1420,24 +1403,13 @@ def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[Book
 
 
 def search_xiunews(keyword: str) -> list[BookItem]:
-    # jieqi 引擎搜索为 POST（searchkey 用 GBK），GET 只返回空表；镜像端点不一，依次尝试 POST，再退回 GET。
-    for path in ("/modules/article/waps.php", "/modules/article/search.php"):
-        try:
-            html, final_url = _xiunews_post(path, keyword)
-        except Exception:
-            continue
-        items = _parse_xiunews_results(html, final_url, keyword)
-        if items:
-            return items
+    # 站点搜索为 GET，searchkey 用 UTF-8 编码（站点已迁移到 UTF-8；旧代码误用 GBK 导致结果恒空）。
+    url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword)}"
     try:
-        get_url = (
-            f"{XIUNEWS_BASE}/modules/article/search.php"
-            f"?searchkey={urllib.parse.quote(keyword.encode('gbk', 'ignore'))}"
-        )
-        html, final_url = _xiunews_fetch(get_url)
-        return _parse_xiunews_results(html, final_url, keyword)
+        html, final_url = _xiunews_fetch(url)
     except Exception:
         return []
+    return _parse_xiunews_results(html, final_url, keyword)
 
 
 def detail_xiunews(bid: str) -> dict[str, Any]:

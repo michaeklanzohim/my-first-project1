@@ -541,7 +541,7 @@
                   </div>
                   <div class="book-info">
                     <div class="book-title" :title="b.title">{{ b.title }}</div>
-                    <div class="book-author">{{ b.author || b.meta || '未知作者' }}</div>
+                    <div v-if="b.author" class="book-author">{{ b.author }}</div>
                     <span class="book-src">{{ bSourceName(b.source) }}</span>
                   </div>
                 </div>
@@ -571,7 +571,7 @@
                   </div>
                   <div class="book-info">
                     <div class="book-title" :title="b.title">{{ b.title }}</div>
-                    <div class="book-author">{{ b.author || b.meta || '' }}</div>
+                    <div v-if="b.author" class="book-author">{{ b.author }}</div>
                     <span class="book-src">{{ bSourceName(b.source) }}</span>
                   </div>
                 </div>

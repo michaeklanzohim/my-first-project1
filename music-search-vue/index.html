@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>音乐搜索 · 三站聚合</title>
+  <title>影音搜索 · 聚合</title>
   <style>
     :root {
       --bg: #0b1020;
@@ -28,13 +28,20 @@
     }
     .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 18px 40px; }
     h1 { margin: 0 0 8px; font-size: 28px; }
-    .sub { color: var(--sub); margin-bottom: 22px; }
+    .sub { color: var(--sub); margin-bottom: 18px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tabs button {
+      background: var(--panel); border: 1px solid var(--line); color: var(--sub);
+      padding: 8px 20px; border-radius: 999px; font-weight: 600; cursor: pointer;
+    }
+    .tabs button.active { background: linear-gradient(135deg, var(--accent), #7a5cff); color: #fff; border: none; }
     .search-bar {
       display: grid;
       grid-template-columns: 1fr 140px 160px;
       gap: 10px;
       margin-bottom: 18px;
     }
+    .search-bar.video-bar { grid-template-columns: 1fr 160px; }
     input, select, button {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -43,13 +50,13 @@
       padding: 12px 14px;
       font-size: 15px;
     }
-    button {
+    .search-bar button {
       cursor: pointer;
       background: linear-gradient(135deg, var(--accent), #7a5cff);
       border: none;
       font-weight: 600;
     }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .search-bar button:disabled { opacity: 0.6; cursor: not-allowed; }
     .layout {
       display: grid;
       grid-template-columns: 1.1fr 0.9fr;
@@ -121,120 +128,255 @@
       padding: 6px 10px; border-radius: 999px; font-size: 12px;
       border: 1px solid var(--line); color: var(--sub);
     }
+    .pill.active { background: rgba(91,140,255,.18); color: var(--text); border-color: var(--accent); cursor: pointer; }
+    .pill-link { cursor: pointer; text-decoration: none; }
+    .pill-link:hover { color: var(--text); border-color: var(--accent); }
+    /* video */
+    .poster-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 12px; padding: 14px; max-height: 62vh; overflow: auto;
+    }
+    .poster { cursor: pointer; position: relative; }
+    .poster img { width: 100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 10px; background: #1f2a49; display: block; }
+    .poster.active img { outline: 2px solid var(--accent); }
+    .poster-note {
+      position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,.65);
+      color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 6px;
+    }
+    .poster-name { font-size: 13px; font-weight: 600; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .poster-meta { font-size: 12px; color: var(--sub); }
+    .video-el { width: 100%; border-radius: 12px; background: #000; aspect-ratio: 16/9; margin-bottom: 12px; }
+    .lines { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    .episodes {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+      gap: 8px; max-height: 30vh; overflow: auto; margin-top: 8px;
+    }
+    .ep-btn {
+      padding: 8px 6px; border-radius: 8px; border: 1px solid var(--line);
+      background: #18223f; color: var(--text); font-size: 13px; cursor: pointer;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .ep-btn.active { background: linear-gradient(135deg, var(--accent2), #2aa7ff); border: none; color: #fff; }
     @media (max-width: 900px) {
       .layout { grid-template-columns: 1fr; }
-      .search-bar { grid-template-columns: 1fr; }
+      .search-bar, .search-bar.video-bar { grid-template-columns: 1fr; }
       .list, .iframe-box { max-height: 45vh; height: 45vh; }
     }
   </style>
 </head>
 <body>
   <div id="app" class="wrap">
-    <h1>音乐搜索聚合</h1>
-    <p class="sub">聚合歌曲海 · 音乐坊 · 放屁网 — 搜索、在线播放、下载</p>
+    <h1>{{ mode === 'music' ? '音乐搜索聚合' : '视频搜索聚合' }}</h1>
+    <p class="sub" v-if="mode === 'music'">聚合歌曲海 · 音乐坊 · 放屁网 — 搜索、在线播放、下载</p>
+    <p class="sub" v-else>聚合 zg01 影视 — 综合搜索、选集、在线播放（m3u8 直链）</p>
 
-    <div class="search-bar">
-      <input v-model="keyword" placeholder="输入歌名或歌手，例如：晴天" @keyup.enter="search" />
-      <select v-model="source">
-        <option value="all">全部来源</option>
-        <option value="gequhai">歌曲海 gequhai.com</option>
-        <option value="yyfang">音乐坊 yyfang.top</option>
-        <option value="fangpi">放屁网 fangpi.net</option>
-      </select>
-      <button :disabled="loading || !keyword.trim()" @click="search">
-        {{ loading ? '搜索中...' : '搜索' }}
-      </button>
+    <div class="tabs">
+      <button :class="{ active: mode === 'music' }" @click="switchMode('music')">音乐</button>
+      <button :class="{ active: mode === 'video' }" @click="switchMode('video')">视频</button>
     </div>
 
-    <div class="sources">
-      <span class="pill">歌曲海：HTML + /api/music</span>
-      <span class="pill">音乐坊：详情 JSON 直链</span>
-      <span class="pill">放屁网：嵌入页 / API（视网络环境）</span>
-    </div>
+    <!-- ===================== 音乐 ===================== -->
+    <template v-if="mode === 'music'">
+      <div class="search-bar">
+        <input v-model="keyword" placeholder="输入歌名或歌手，例如：晴天" @keyup.enter="search" />
+        <select v-model="source">
+          <option value="all">全部来源</option>
+          <option value="gequhai">歌曲海 gequhai.com</option>
+          <option value="yyfang">音乐坊 yyfang.top</option>
+          <option value="fangpi">放屁网 fangpi.net</option>
+        </select>
+        <button :disabled="loading || !keyword.trim()" @click="search">
+          {{ loading ? '搜索中...' : '搜索' }}
+        </button>
+      </div>
 
-    <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="fangpiMeta.message" class="hint">{{ fangpiMeta.message }}</p>
+      <div class="sources">
+        <span class="pill">歌曲海：HTML + /api/music</span>
+        <span class="pill">音乐坊：详情 JSON 直链</span>
+        <span class="pill">放屁网：嵌入页 / API（视网络环境）</span>
+      </div>
 
-    <div class="layout">
-      <section class="card">
-        <div class="card-hd">
-          <span>搜索结果</span>
-          <span>{{ items.length }} 条</span>
-        </div>
-        <div v-if="source === 'fangpi' && fangpiMeta.iframeUrl && !items.length" class="list">
-          <iframe class="iframe-box" :src="fangpiMeta.iframeUrl" title="放屁网搜索"></iframe>
-        </div>
-        <div v-else-if="!items.length && !loading" class="empty">输入关键词开始搜索</div>
-        <div v-else class="list">
-          <div
-            v-for="song in items"
-            :key="song.source + song.id"
-            class="item"
-            :class="{ active: current?.id === song.id && current?.source === song.source }"
-            @click="playSong(song)"
-          >
-            <img class="cover" :src="song.cover || placeholder" alt="" />
-            <div>
-              <div class="name">{{ song.name }}</div>
-              <div class="meta">{{ song.artist || '未知歌手' }}</div>
-            </div>
-            <span class="tag">{{ sourceLabel(song.source) }}</span>
+      <p v-if="error" class="error">{{ error }}</p>
+      <p v-if="fangpiMeta.message" class="hint">{{ fangpiMeta.message }}</p>
+
+      <div class="layout">
+        <section class="card">
+          <div class="card-hd">
+            <span>搜索结果</span>
+            <span>{{ items.length }} 条</span>
           </div>
-        </div>
-      </section>
-
-      <section class="card player">
-        <div v-if="!current" class="empty">选择一首歌曲播放</div>
-        <template v-else>
-          <div class="player-top">
-            <img class="player-cover" :src="detail.cover || placeholder" alt="" />
-            <div>
-              <div class="player-title">{{ detail.name || current.name }}</div>
-              <div class="player-artist">{{ detail.artist || current.artist }}</div>
-              <div class="meta" style="margin-top:8px;">来源：{{ sourceLabel(current.source) }}</div>
-            </div>
+          <div v-if="source === 'fangpi' && fangpiMeta.iframeUrl && !items.length" class="list">
+            <iframe class="iframe-box" :src="fangpiMeta.iframeUrl" title="放屁网搜索"></iframe>
           </div>
-
-          <audio
-            v-if="audioSrc"
-            :key="audioSrc"
-            ref="audioRef"
-            :src="audioSrc"
-            controls
-            preload="auto"
-            @error="onAudioError"
-          ></audio>
-          <p v-else-if="detailLoading" class="hint">正在获取播放链接...</p>
-          <p v-else class="hint">未获取到可播链接，可尝试下载或打开原站页面。</p>
-
-          <div class="actions">
-            <select
-              v-if="qualities.length"
-              v-model="selectedQualityUrl"
-              class="btn quality-select"
-              :title="'选择音质'"
+          <div v-else-if="!items.length && !loading" class="empty">输入关键词开始搜索</div>
+          <div v-else class="list">
+            <div
+              v-for="song in items"
+              :key="song.source + song.id"
+              class="item"
+              :class="{ active: current?.id === song.id && current?.source === song.source }"
+              @click="playSong(song)"
             >
-              <option v-for="q in qualities" :key="q.url" :value="q.url">{{ q.label }}</option>
-            </select>
-            <button
-              v-if="qualities.length"
-              class="btn primary"
-              :disabled="downloading"
-              @click="downloadMusic"
-            >{{ downloading ? '下载中...' : (selectedQuality && selectedQuality.kind === 'pan' ? '去网盘下载' : '下载') }}</button>
-            <a v-if="detail.pageUrl" class="btn" :href="detail.pageUrl" target="_blank" rel="noopener">原站页面</a>
+              <img class="cover" :src="song.cover || placeholder" alt="" />
+              <div>
+                <div class="name">{{ song.name }}</div>
+                <div class="meta">{{ song.artist || '未知歌手' }}</div>
+              </div>
+              <span class="tag">{{ sourceLabel(song.source) }}</span>
+            </div>
           </div>
-        </template>
-      </section>
-    </div>
+        </section>
+
+        <section class="card player">
+          <div v-if="!current" class="empty">选择一首歌曲播放</div>
+          <template v-else>
+            <div class="player-top">
+              <img class="player-cover" :src="detail.cover || placeholder" alt="" />
+              <div>
+                <div class="player-title">{{ detail.name || current.name }}</div>
+                <div class="player-artist">{{ detail.artist || current.artist }}</div>
+                <div class="meta" style="margin-top:8px;">来源：{{ sourceLabel(current.source) }}</div>
+              </div>
+            </div>
+
+            <audio
+              v-if="audioSrc"
+              :key="audioSrc"
+              ref="audioRef"
+              :src="audioSrc"
+              controls
+              preload="auto"
+              @error="onAudioError"
+            ></audio>
+            <p v-else-if="detailLoading" class="hint">正在获取播放链接...</p>
+            <p v-else class="hint">未获取到可播链接，可尝试下载或打开原站页面。</p>
+
+            <div class="actions">
+              <select
+                v-if="qualities.length"
+                v-model="selectedQualityUrl"
+                class="btn quality-select"
+                :title="'选择音质'"
+              >
+                <option v-for="q in qualities" :key="q.url" :value="q.url">{{ q.label }}</option>
+              </select>
+              <button
+                v-if="qualities.length"
+                class="btn primary"
+                :disabled="downloading"
+                @click="downloadMusic"
+              >{{ downloading ? '下载中...' : (selectedQuality && selectedQuality.kind === 'pan' ? '去网盘下载' : '下载') }}</button>
+              <a v-if="detail.pageUrl" class="btn" :href="detail.pageUrl" target="_blank" rel="noopener">原站页面</a>
+            </div>
+          </template>
+        </section>
+      </div>
+    </template>
+
+    <!-- ===================== 视频 ===================== -->
+    <template v-else>
+      <div class="search-bar video-bar">
+        <input v-model="vKeyword" placeholder="输入影视名，例如：凡人修仙传" @keyup.enter="vsearch" />
+        <button :disabled="vLoading || !vKeyword.trim()" @click="vsearch">
+          {{ vLoading ? '搜索中...' : '搜索' }}
+        </button>
+      </div>
+
+      <div class="sources">
+        <span class="pill active">zg01.inavs.cn：综合搜索 + 在线播放</span>
+        <a
+          v-for="b in vBlocked"
+          :key="b.key"
+          class="pill pill-link"
+          :href="b.url"
+          target="_blank"
+          rel="noopener"
+          :title="b.note"
+        >{{ b.name }}：打开原站 ↗</a>
+      </div>
+
+      <p v-if="vError" class="error">{{ vError }}</p>
+
+      <div class="layout">
+        <section class="card">
+          <div class="card-hd">
+            <span>搜索结果</span>
+            <span>{{ vItems.length }} 条</span>
+          </div>
+          <div v-if="!vItems.length && !vLoading" class="empty">输入影视名开始搜索</div>
+          <div v-else-if="vLoading" class="empty">搜索中...</div>
+          <div v-else class="poster-grid">
+            <div
+              v-for="v in vItems"
+              :key="v.id"
+              class="poster"
+              :class="{ active: vCurrent && vCurrent.id === v.id }"
+              @click="openVideo(v)"
+            >
+              <img :src="v.cover || vPlaceholder" alt="" referrerpolicy="no-referrer" />
+              <span v-if="v.note" class="poster-note">{{ v.note }}</span>
+              <div class="poster-name" :title="v.name">{{ v.name }}</div>
+              <div class="poster-meta">{{ [v.type, v.year].filter(Boolean).join(' · ') }}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card player">
+          <div v-if="!vCurrent" class="empty">选择一部影视播放</div>
+          <template v-else>
+            <div class="player-title" style="margin-bottom:10px;">{{ vDetail.name || vCurrent.name }}</div>
+            <p v-if="vDetailLoading" class="hint">正在加载剧集...</p>
+
+            <video ref="videoRef" class="video-el" controls playsinline></video>
+            <p v-if="vPlayMsg" class="hint">{{ vPlayMsg }}</p>
+            <a
+              v-if="vExternalUrl"
+              class="btn"
+              :href="vExternalUrl"
+              target="_blank"
+              rel="noopener"
+            >该集为外链（来源：{{ vCurrentFrom || '外部' }}），点此打开原站播放 ↗</a>
+
+            <div v-if="vDetail.lines && vDetail.lines.length > 1" class="lines">
+              <button
+                v-for="(l, idx) in vDetail.lines"
+                :key="l.line"
+                class="pill"
+                :class="{ active: vLineIdx === idx }"
+                @click="selectLine(idx)"
+              >线路{{ idx + 1 }}<span v-if="l.from"> · {{ l.from }}</span>{{ l.playable ? '' : '（外链）' }}</button>
+            </div>
+
+            <div v-if="curLine" class="episodes">
+              <button
+                v-for="e in curLine.episodes"
+                :key="e.ep"
+                class="ep-btn"
+                :class="{ active: vEp === e.ep }"
+                :title="e.name"
+                @click="playEpisode(e.ep)"
+              >{{ e.name }}</button>
+            </div>
+
+            <div class="actions" style="margin-top:14px;">
+              <a v-if="vDetail.pageUrl" class="btn" :href="vDetail.pageUrl" target="_blank" rel="noopener">原站页面</a>
+            </div>
+          </template>
+        </section>
+      </div>
+    </template>
   </div>
 
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <script>
     const { createApp, ref, computed, watch, nextTick } = Vue;
 
     createApp({
       setup() {
+        const mode = ref("music");
+
+        // ---------------- 音乐 ----------------
         const keyword = ref("");
         const source = ref("all");
         const items = ref([]);
@@ -394,11 +536,178 @@
           }
         };
 
+        // ---------------- 视频 ----------------
+        const VIDEO_REFERER = "https://zg01.inavs.cn/";
+        const vKeyword = ref("");
+        const vItems = ref([]);
+        const vBlocked = ref([]);
+        const vLoading = ref(false);
+        const vError = ref("");
+        const vCurrent = ref(null);
+        const vDetail = ref({});
+        const vDetailLoading = ref(false);
+        const vLineIdx = ref(0);
+        const vEp = ref(null);
+        const videoRef = ref(null);
+        const vPlayMsg = ref("");
+        const vExternalUrl = ref("");
+        const vCurrentFrom = ref("");
+        let hls = null;
+        const vPlaceholder = "data:image/svg+xml," + encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"><rect width="100%" height="100%" fill="#243156"/><text x="50%" y="52%" fill="#9fb0d9" font-size="16" text-anchor="middle">视频</text></svg>'
+        );
+
+        const curLine = computed(() => (vDetail.value.lines || [])[vLineIdx.value] || null);
+
+        const proxiedVideo = (url) =>
+          "/api/video/stream?" + new URLSearchParams({ url, referer: VIDEO_REFERER }).toString();
+
+        const destroyVideo = () => {
+          if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+          const v = videoRef.value;
+          if (v) { try { v.pause(); v.removeAttribute("src"); v.load(); } catch (e) {} }
+        };
+
+        const switchMode = (m) => {
+          if (m === mode.value) return;
+          if (m === "music") destroyVideo();
+          mode.value = m;
+        };
+
+        const vsearch = async () => {
+          const q = vKeyword.value.trim();
+          if (!q) return;
+          vLoading.value = true;
+          vError.value = "";
+          vItems.value = [];
+          vCurrent.value = null;
+          vDetail.value = {};
+          destroyVideo();
+          try {
+            const res = await fetch(`/api/video/search?q=${encodeURIComponent(q)}`);
+            const data = await res.json();
+            vBlocked.value = data.blocked || [];
+            if (!res.ok) throw new Error(data.error || "搜索失败");
+            vItems.value = data.items || [];
+            if (data.error) vError.value = data.error;
+            else if (!vItems.value.length) vError.value = "没有找到相关影视，换个关键词试试。";
+          } catch (e) {
+            vError.value = e.message || String(e);
+          } finally {
+            vLoading.value = false;
+          }
+        };
+
+        const openVideo = async (v) => {
+          vCurrent.value = v;
+          vDetail.value = {};
+          vEp.value = null;
+          vLineIdx.value = 0;
+          vPlayMsg.value = "";
+          vExternalUrl.value = "";
+          vCurrentFrom.value = "";
+          destroyVideo();
+          vDetailLoading.value = true;
+          try {
+            const res = await fetch(`/api/video/detail?id=${encodeURIComponent(v.id)}&source=${v.source}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "加载剧集失败");
+            vDetail.value = data;
+            const lines = data.lines || [];
+            let idx = lines.findIndex((l) => l.playable);
+            vLineIdx.value = idx < 0 ? 0 : idx;
+            if (curLine.value && curLine.value.episodes.length) {
+              playEpisode(curLine.value.episodes[0].ep);
+            }
+          } catch (e) {
+            vError.value = e.message || String(e);
+          } finally {
+            vDetailLoading.value = false;
+          }
+        };
+
+        const selectLine = (idx) => {
+          vLineIdx.value = idx;
+          vEp.value = null;
+          vPlayMsg.value = "";
+          vExternalUrl.value = "";
+          destroyVideo();
+          if (curLine.value && curLine.value.episodes.length) {
+            playEpisode(curLine.value.episodes[0].ep);
+          }
+        };
+
+        const playM3u8 = async (proxied) => {
+          await nextTick();
+          const video = videoRef.value;
+          if (!video) return;
+          if (window.Hls && window.Hls.isSupported()) {
+            hls = new window.Hls({ maxBufferLength: 30 });
+            hls.loadSource(proxied);
+            hls.attachMedia(video);
+            hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+            hls.on(window.Hls.Events.ERROR, (evt, data) => {
+              if (data && data.fatal) {
+                vPlayMsg.value = "播放失败：" + (data.details || "未知错误") +
+                  "（该源可能拦截了服务器 IP，换条线路或点『原站页面』）";
+              }
+            });
+          } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = proxied;
+            video.play().catch(() => {});
+          } else {
+            vPlayMsg.value = "当前浏览器不支持 HLS 播放。";
+          }
+        };
+
+        const playEpisode = async (ep) => {
+          if (!vCurrent.value || !curLine.value) return;
+          vEp.value = ep;
+          vPlayMsg.value = "正在解析播放地址...";
+          vExternalUrl.value = "";
+          vCurrentFrom.value = "";
+          destroyVideo();
+          try {
+            const q = new URLSearchParams({
+              id: vCurrent.value.id,
+              source: vCurrent.value.source,
+              line: curLine.value.line,
+              ep,
+            });
+            const res = await fetch(`/api/video/parse?${q.toString()}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "解析失败");
+            vCurrentFrom.value = data.from || "";
+            if (data.isM3u8) {
+              await playM3u8(proxiedVideo(data.url));
+              vPlayMsg.value = "";
+            } else if (data.isMp4) {
+              await nextTick();
+              if (videoRef.value) {
+                videoRef.value.src = proxiedVideo(data.url);
+                videoRef.value.play().catch(() => {});
+              }
+              vPlayMsg.value = "";
+            } else {
+              vExternalUrl.value = data.url || "";
+              vPlayMsg.value = data.url ? "" : "未获取到播放地址。";
+            }
+          } catch (e) {
+            vPlayMsg.value = e.message || String(e);
+          }
+        };
+
         return {
+          mode, switchMode,
+          // music
           keyword, source, items, current, detail, loading, detailLoading, downloading,
           error, fangpiMeta, audioRef, placeholder, sourceLabel, audioSrc, canDownload,
           qualities, selectedQualityUrl, selectedQuality,
           search, playSong, onAudioError, downloadMusic,
+          // video
+          vKeyword, vItems, vBlocked, vLoading, vError, vCurrent, vDetail, vDetailLoading,
+          vLineIdx, vEp, videoRef, vPlayMsg, vExternalUrl, vCurrentFrom, vPlaceholder,
+          curLine, vsearch, openVideo, selectLine, playEpisode,
         };
       },
     }).mount("#app");

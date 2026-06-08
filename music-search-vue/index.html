@@ -158,22 +158,78 @@
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .ep-btn.active { background: linear-gradient(135deg, var(--accent2), #2aa7ff); border: none; color: #fff; }
+    /* ebook */
+    .book-desc {
+      color: var(--sub); font-size: 14px; line-height: 1.7; margin: 4px 0 14px;
+      max-height: 8.4em; overflow: auto; white-space: pre-line;
+    }
+    .chapter-box { margin-top: 14px; }
+    .chapter-list {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 8px; max-height: 34vh; overflow: auto;
+    }
+    .chapter-item {
+      padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+      background: #18223f; color: var(--text); font-size: 13px; cursor: pointer;
+      text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .chapter-item:hover { border-color: var(--accent); }
+    .chapter-item.active { background: linear-gradient(135deg, var(--accent2), #2aa7ff); border: none; color: #fff; }
+    /* reader (mobile-friendly) */
+    .reader-mask {
+      position: fixed; inset: 0; z-index: 50; background: rgba(5, 9, 20, 0.78);
+      display: flex; justify-content: center; align-items: stretch; padding: 24px;
+    }
+    .reader {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      width: 100%; max-width: 820px; display: flex; flex-direction: column; overflow: hidden;
+    }
+    .reader-bar {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 12px 16px; border-bottom: 1px solid var(--line); flex: none;
+    }
+    .reader-bottom { border-bottom: 0; border-top: 1px solid var(--line); }
+    .reader-title {
+      flex: 1; text-align: center; font-weight: 600; font-size: 15px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .reader-font { display: flex; gap: 8px; }
+    .reader-btn {
+      padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line);
+      background: #18223f; color: var(--text); font-size: 14px; cursor: pointer;
+    }
+    .reader-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .reader-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .reader-body { flex: 1; overflow: auto; padding: 22px 28px 40px; line-height: 1.9; }
+    .reader-h2 { font-size: 1.15em; margin: 0 0 18px; text-align: center; }
+    .reader-p { margin: 0 0 1em; text-indent: 2em; color: #dde6ff; }
+    .reader-toc {
+      flex: 1; overflow: auto; padding: 16px; display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; align-content: start;
+    }
     @media (max-width: 900px) {
       .layout { grid-template-columns: 1fr; }
       .search-bar, .search-bar.video-bar { grid-template-columns: 1fr; }
       .list, .iframe-box { max-height: 45vh; height: 45vh; }
+      .reader-mask { padding: 0; }
+      .reader { border-radius: 0; max-width: 100%; }
+      .reader-body { padding: 18px 18px 36px; }
+      .reader-btn { padding: 8px 10px; font-size: 13px; }
+      .reader-toc { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
 <body>
   <div id="app" class="wrap">
-    <h1>{{ mode === 'music' ? '音乐搜索聚合' : '视频搜索聚合' }}</h1>
+    <h1>{{ mode === 'music' ? '音乐搜索聚合' : (mode === 'video' ? '视频搜索聚合' : '电子书搜索聚合') }}</h1>
     <p class="sub" v-if="mode === 'music'">聚合歌曲海 · 音乐坊 · 放屁网 — 搜索、在线播放、下载</p>
-    <p class="sub" v-else>多源聚合影视搜索 — zg01 + 多个免费采集站，选集在线播放（m3u8 直链 hls.js）</p>
+    <p class="sub" v-else-if="mode === 'video'">多源聚合影视搜索 — zg01 + 多个免费采集站，选集在线播放（m3u8 直链 hls.js）</p>
+    <p class="sub" v-else>多源聚合电子书搜索 — 安娜的档案 · 小璃盘 · 笔趣阁，在线阅读（支持小屏）/ 下载</p>
 
     <div class="tabs">
       <button :class="{ active: mode === 'music' }" @click="switchMode('music')">音乐</button>
       <button :class="{ active: mode === 'video' }" @click="switchMode('video')">视频</button>
+      <button :class="{ active: mode === 'ebook' }" @click="switchMode('ebook')">电子书</button>
     </div>
 
     <!-- ===================== 音乐 ===================== -->
@@ -275,7 +331,7 @@
     </template>
 
     <!-- ===================== 视频 ===================== -->
-    <template v-else>
+    <template v-else-if="mode === 'video'">
       <div class="search-bar video-bar">
         <input v-model="vKeyword" placeholder="输入影视名，例如：凡人修仙传" @keyup.enter="vsearch" />
         <button :disabled="vLoading || !vKeyword.trim()" @click="vsearch">
@@ -367,6 +423,150 @@
         </section>
       </div>
     </template>
+
+    <!-- ===================== 电子书 ===================== -->
+    <template v-else>
+      <div class="search-bar video-bar">
+        <input v-model="bKeyword" placeholder="输入书名 / 作者，例如：红楼梦" @keyup.enter="bsearch" />
+        <button :disabled="bLoading || !bKeyword.trim()" @click="bsearch">
+          {{ bLoading ? '搜索中...' : '搜索' }}
+        </button>
+      </div>
+
+      <div class="sources">
+        <span class="pill active">安娜的档案 · 小璃盘 · 笔趣阁：服务端聚合搜索</span>
+        <a
+          v-for="b in bBlocked"
+          :key="b.key"
+          class="pill pill-link"
+          :href="b.url"
+          target="_blank"
+          rel="noopener"
+          :title="b.note"
+        >{{ b.name }}：打开原站搜索 ↗</a>
+      </div>
+
+      <p v-if="bError" class="error">{{ bError }}</p>
+
+      <div class="layout">
+        <section class="card">
+          <div class="card-hd">
+            <span>搜索结果</span>
+            <span>{{ bItems.length }} 条</span>
+          </div>
+          <div v-if="!bItems.length && !bLoading" class="empty">输入书名或作者开始搜索</div>
+          <div v-else-if="bLoading" class="empty">搜索中...</div>
+          <div v-else class="poster-grid">
+            <div
+              v-for="b in bItems"
+              :key="b.source + b.id"
+              class="poster"
+              :class="{ active: bCurrent && bCurrent.source === b.source && bCurrent.id === b.id }"
+              @click="openBook(b)"
+            >
+              <img :src="b.cover || bPlaceholder" alt="" referrerpolicy="no-referrer" />
+              <span class="poster-badge">{{ bSourceName(b.source) }}</span>
+              <span v-if="b.ext" class="poster-note">{{ b.ext.toUpperCase() }}</span>
+              <span v-else-if="b.kind === 'read'" class="poster-note">可阅读</span>
+              <div class="poster-name" :title="b.title">{{ b.title }}</div>
+              <div class="poster-meta">{{ b.author || b.meta || '' }}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card player">
+          <div v-if="!bCurrent" class="empty">选择一本书查看详情</div>
+          <template v-else>
+            <div class="player-top">
+              <img class="player-cover" :src="bDetail.cover || bCurrent.cover || bPlaceholder" alt="" referrerpolicy="no-referrer" />
+              <div>
+                <div class="player-title">{{ bDetail.title || bCurrent.title }}</div>
+                <div class="player-artist" v-if="bDetail.author || bCurrent.author">{{ bDetail.author || bCurrent.author }}</div>
+                <div class="meta" style="margin-top:8px;">来源：{{ bSourceName(bCurrent.source) }}</div>
+                <div class="meta" v-if="bCurrent.meta" style="margin-top:4px;">{{ bCurrent.meta }}</div>
+              </div>
+            </div>
+
+            <p v-if="bDetailLoading" class="hint">正在加载详情...</p>
+            <p v-if="bDetail.desc" class="book-desc">{{ bDetail.desc }}</p>
+
+            <div class="actions">
+              <button
+                v-if="bDetail.kind === 'read' && (bDetail.chapters || []).length"
+                class="btn primary"
+                @click="openReader(0)"
+              >开始在线阅读</button>
+              <button
+                v-if="bDetail.kind === 'read' && (bDetail.chapters || []).length"
+                class="btn"
+                :disabled="bDownloading"
+                @click="downloadBook"
+              >{{ bDownloading ? '打包中...' : '下载 TXT' }}</button>
+              <a
+                v-for="(d, i) in (bDetail.downloads || [])"
+                :key="i"
+                class="btn primary"
+                :href="d.url"
+                target="_blank"
+                rel="noopener"
+              >{{ d.label }} ↗</a>
+              <a v-if="bDetail.pageUrl" class="btn" :href="bDetail.pageUrl" target="_blank" rel="noopener">打开原站页面 ↗</a>
+            </div>
+
+            <div v-if="bDetail.kind === 'read' && (bDetail.chapters || []).length" class="chapter-box">
+              <div class="card-hd" style="padding:12px 0;">
+                <span>目录</span><span>{{ bDetail.chapters.length }} 章</span>
+              </div>
+              <div class="chapter-list">
+                <button
+                  v-for="(c, i) in bDetail.chapters"
+                  :key="c.id"
+                  class="chapter-item"
+                  @click="openReader(i)"
+                >{{ c.name }}</button>
+              </div>
+            </div>
+          </template>
+        </section>
+      </div>
+    </template>
+
+  <!-- ===================== 阅读器（小屏适配） ===================== -->
+  <div v-if="readerOpen" class="reader-mask" @click.self="closeReader">
+    <div class="reader" :style="{ fontSize: readerFont + 'px' }">
+      <div class="reader-bar reader-top">
+        <button class="reader-btn" @click="closeReader">‹ 返回</button>
+        <span class="reader-title">{{ readerChapter.name || (bDetail.title || '') }}</span>
+        <button class="reader-btn" @click="readerListOpen = !readerListOpen">目录</button>
+      </div>
+
+      <div v-if="readerListOpen" class="reader-toc">
+        <button
+          v-for="(c, i) in (bDetail.chapters || [])"
+          :key="c.id"
+          class="chapter-item"
+          :class="{ active: i === readerIdx }"
+          @click="openReader(i)"
+        >{{ c.name }}</button>
+      </div>
+
+      <div v-else class="reader-body" ref="readerBodyRef">
+        <h2 class="reader-h2">{{ readerChapter.name }}</h2>
+        <p v-if="readerLoading" class="hint">正在加载章节...</p>
+        <p v-else-if="readerError" class="error">{{ readerError }}</p>
+        <p v-for="(p, i) in readerChapter.paragraphs" :key="i" class="reader-p">{{ p }}</p>
+      </div>
+
+      <div class="reader-bar reader-bottom">
+        <button class="reader-btn" :disabled="readerIdx <= 0 || readerLoading" @click="openReader(readerIdx - 1)">上一章</button>
+        <span class="reader-font">
+          <button class="reader-btn" @click="readerFont = Math.max(14, readerFont - 2)">A-</button>
+          <button class="reader-btn" @click="readerFont = Math.min(30, readerFont + 2)">A+</button>
+        </span>
+        <button class="reader-btn" :disabled="readerIdx >= (bDetail.chapters || []).length - 1 || readerLoading" @click="openReader(readerIdx + 1)">下一章</button>
+      </div>
+    </div>
+  </div>
   </div>
 
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
@@ -574,7 +774,7 @@
 
         const switchMode = (m) => {
           if (m === mode.value) return;
-          if (m === "music") destroyVideo();
+          if (m !== "video") destroyVideo();
           mode.value = m;
         };
 
@@ -727,6 +927,138 @@
           }
         };
 
+        // ---------------- 电子书 ----------------
+        const bKeyword = ref("");
+        const bItems = ref([]);
+        const bSources = ref({ annas: "安娜的档案", xiaolipan: "小璃盘", xiunews: "笔趣阁" });
+        const bSourceName = (key) => bSources.value[key] || key || "";
+        const bBlocked = ref([]);
+        const bLoading = ref(false);
+        const bError = ref("");
+        const bCurrent = ref(null);
+        const bDetail = ref({});
+        const bDetailLoading = ref(false);
+        const bDownloading = ref(false);
+        const bPlaceholder = "data:image/svg+xml," + encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"><rect width="100%" height="100%" fill="#243156"/><text x="50%" y="52%" fill="#9fb0d9" font-size="16" text-anchor="middle">电子书</text></svg>'
+        );
+
+        // 阅读器状态
+        const readerOpen = ref(false);
+        const readerIdx = ref(0);
+        const readerChapter = ref({ name: "", paragraphs: [] });
+        const readerLoading = ref(false);
+        const readerError = ref("");
+        const readerListOpen = ref(false);
+        const readerFont = ref(18);
+        const readerBodyRef = ref(null);
+
+        const bsearch = async () => {
+          const q = bKeyword.value.trim();
+          if (!q) return;
+          bLoading.value = true;
+          bError.value = "";
+          bItems.value = [];
+          bCurrent.value = null;
+          bDetail.value = {};
+          try {
+            const res = await fetch(`/api/book/search?q=${encodeURIComponent(q)}`);
+            const data = await res.json();
+            bBlocked.value = data.blocked || [];
+            if (Array.isArray(data.sources)) {
+              const map = {};
+              data.sources.forEach((s) => { map[s.key] = s.name; });
+              bSources.value = { ...bSources.value, ...map };
+            }
+            if (!res.ok) throw new Error(data.error || "搜索失败");
+            bItems.value = data.items || [];
+            if (!bItems.value.length) bError.value = "没有找到相关电子书，换个关键词或打开原站搜索。";
+          } catch (e) {
+            bError.value = e.message || String(e);
+          } finally {
+            bLoading.value = false;
+          }
+        };
+
+        const openBook = async (b) => {
+          bCurrent.value = b;
+          bDetail.value = { title: b.title, author: b.author, cover: b.cover, kind: b.kind };
+          bDetailLoading.value = true;
+          bError.value = "";
+          try {
+            const res = await fetch(`/api/book/detail?source=${b.source}&id=${encodeURIComponent(b.id)}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "加载详情失败");
+            bDetail.value = data;
+          } catch (e) {
+            bError.value = e.message || String(e);
+          } finally {
+            bDetailLoading.value = false;
+          }
+        };
+
+        const loadChapter = async (idx) => {
+          const chapters = bDetail.value.chapters || [];
+          if (idx < 0 || idx >= chapters.length || !bCurrent.value) return;
+          readerIdx.value = idx;
+          readerListOpen.value = false;
+          readerLoading.value = true;
+          readerError.value = "";
+          const ch = chapters[idx];
+          readerChapter.value = { name: ch.name, paragraphs: [] };
+          try {
+            const q = new URLSearchParams({ source: bCurrent.value.source, book: bCurrent.value.id, id: ch.id });
+            const res = await fetch(`/api/book/chapter?${q.toString()}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "章节加载失败");
+            readerChapter.value = { name: data.name || ch.name, paragraphs: data.paragraphs || [] };
+            await nextTick();
+            if (readerBodyRef.value) readerBodyRef.value.scrollTop = 0;
+          } catch (e) {
+            readerError.value = e.message || String(e);
+          } finally {
+            readerLoading.value = false;
+          }
+        };
+
+        const openReader = (idx) => {
+          readerOpen.value = true;
+          readerListOpen.value = false;
+          loadChapter(idx);
+        };
+
+        const closeReader = () => {
+          readerOpen.value = false;
+        };
+
+        const downloadBook = async () => {
+          if (!bCurrent.value) return;
+          bDownloading.value = true;
+          bError.value = "";
+          const filename = `${bDetail.value.title || bCurrent.value.title}-${bDetail.value.author || ""}`.replace(/-$/, "") + ".txt";
+          try {
+            const q = new URLSearchParams({ source: bCurrent.value.source, id: bCurrent.value.id });
+            const res = await fetch(`/api/book/download?${q.toString()}`);
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || `下载失败 (${res.status})`);
+            }
+            const blob = await res.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = objectUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(objectUrl);
+          } catch (e) {
+            bError.value = e.message || String(e);
+          } finally {
+            bDownloading.value = false;
+          }
+        };
+
         return {
           mode, switchMode,
           // music
@@ -738,6 +1070,11 @@
           vKeyword, vItems, vBlocked, vLoading, vError, vCurrent, vDetail, vDetailLoading,
           vLineIdx, vEp, videoRef, vPlayMsg, vExternalUrl, vCurrentFrom, vPlaceholder,
           curLine, vsearch, openVideo, selectLine, playEpisode, vSources, vSourceName,
+          // ebook
+          bKeyword, bItems, bBlocked, bLoading, bError, bCurrent, bDetail, bDetailLoading,
+          bDownloading, bPlaceholder, bSourceName, bsearch, openBook, downloadBook,
+          readerOpen, readerIdx, readerChapter, readerLoading, readerError, readerListOpen,
+          readerFont, readerBodyRef, openReader, closeReader,
         };
       },
     }).mount("#app");

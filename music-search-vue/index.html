@@ -263,6 +263,9 @@
     .reader-btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .reader-body { flex: 1; overflow: auto; padding: 22px 28px 40px; line-height: 1.9; }
     .reader-h2 { font-size: 1.15em; margin: 0 0 18px; text-align: center; }
+    .reader-fallback { margin: 18px 0; text-align: center; }
+    .reader-fallback-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 14px; }
+    .reader-fallback-actions a.reader-btn { text-decoration: none; display: inline-flex; align-items: center; }
     .reader-p { margin: 0 0 1em; text-indent: 2em; color: #dde6ff; }
     .reader-toc {
       flex: 1; overflow: auto; padding: 16px; display: grid;
@@ -659,7 +662,13 @@
       <div v-else class="reader-body" ref="readerBodyRef">
         <h2 class="reader-h2">{{ readerChapter.name }}</h2>
         <p v-if="readerLoading" class="hint">正在加载章节...</p>
-        <p v-else-if="readerError" class="error">{{ readerError }}</p>
+        <div v-else-if="readerError" class="reader-fallback">
+          <p class="error">{{ readerError }}</p>
+          <div class="reader-fallback-actions">
+            <button class="reader-btn" @click="retryChapter">重试本章</button>
+            <a v-if="readerErrorUrl" class="reader-btn" :href="readerErrorUrl" target="_blank" rel="noopener">在原站阅读本章 ↗</a>
+          </div>
+        </div>
         <p v-for="(p, i) in readerChapter.paragraphs" :key="i" class="reader-p">{{ p }}</p>
       </div>
 
@@ -1061,6 +1070,7 @@
         const readerChapter = ref({ name: "", paragraphs: [] });
         const readerLoading = ref(false);
         const readerError = ref("");
+        const readerErrorUrl = ref("");
         const readerListOpen = ref(false);
         const readerFont = ref(18);
         const readerBodyRef = ref(null);
@@ -1116,22 +1126,29 @@
           readerListOpen.value = false;
           readerLoading.value = true;
           readerError.value = "";
+          readerErrorUrl.value = "";
           const ch = chapters[idx];
           readerChapter.value = { name: ch.name, paragraphs: [] };
           try {
             const q = new URLSearchParams({ source: bCurrent.value.source, book: bCurrent.value.id, id: ch.id });
             const res = await fetch(`/api/book/chapter?${q.toString()}`);
             const data = await res.json();
-            if (!res.ok) throw new Error(data.error || "章节加载失败");
+            if (!res.ok) {
+              readerErrorUrl.value = data.chapterUrl || ch.url || "";
+              throw new Error(data.error || "章节加载失败");
+            }
             readerChapter.value = { name: data.name || ch.name, paragraphs: data.paragraphs || [] };
             await nextTick();
             if (readerBodyRef.value) readerBodyRef.value.scrollTop = 0;
           } catch (e) {
             readerError.value = e.message || String(e);
+            if (!readerErrorUrl.value) readerErrorUrl.value = ch.url || "";
           } finally {
             readerLoading.value = false;
           }
         };
+
+        const retryChapter = () => loadChapter(readerIdx.value);
 
         const openReader = (idx) => {
           readerOpen.value = true;
@@ -1186,8 +1203,8 @@
           bKeyword, bItems, bReadItems, bDownloadItems, bBlocked, bLoading, bError,
           bCurrent, bDetail, bDetailLoading, onBookCoverError,
           bDownloading, bPlaceholder, bSourceName, bsearch, openBook, downloadBook,
-          readerOpen, readerIdx, readerChapter, readerLoading, readerError, readerListOpen,
-          readerFont, readerBodyRef, openReader, closeReader,
+          readerOpen, readerIdx, readerChapter, readerLoading, readerError, readerErrorUrl, readerListOpen,
+          readerFont, readerBodyRef, openReader, closeReader, retryChapter,
         };
       },
     }).mount("#app");

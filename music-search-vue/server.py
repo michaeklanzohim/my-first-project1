@@ -7,6 +7,7 @@ import base64
 import json
 import re
 import threading
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1181,12 +1182,13 @@ def search_annas(keyword: str) -> list[BookItem]:
         if md5 in seen:
             continue
         seen.add(md5)
+        # 向上找包含封面图的整条记录容器（标题在文本列里，封面图在同级另一列）。
         row = a
-        for _ in range(6):
+        for _ in range(8):
             row = row.parent
             if row is None:
                 break
-            if row.name == "div" and "flex" in (row.get("class") or []):
+            if row.name == "div" and _annas_img(row):
                 break
         meta = ""
         ext = ""
@@ -1328,11 +1330,19 @@ def _xiunews_warm_session() -> Any:
             sess = cffi_requests.Session(impersonate="chrome124")
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             try:
-                sess.get(XIUNEWS_BASE + "/", timeout=15)
+                # 预热取 cookie；站点被拦时用短超时，避免冷启动白等。
+                sess.get(XIUNEWS_BASE + "/", timeout=6)
             except Exception:
                 pass
             _xiunews_session = sess
         return _xiunews_session
+
+
+def _xiunews_reset_session() -> None:
+    """丢弃当前会话，下次取用时会重新预热（用于连接超时/被拦后的重试）。"""
+    global _xiunews_session
+    with _xiunews_lock:
+        _xiunews_session = None
 
 
 def _xiunews_decode(raw: bytes) -> str:
@@ -1343,20 +1353,34 @@ def _xiunews_decode(raw: bytes) -> str:
         return raw.decode("gbk", "ignore")
 
 
-def _xiunews_fetch(url: str, timeout: int = 15) -> tuple[str, str]:
-    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。"""
-    sess = _xiunews_warm_session()
-    if sess is not None:
-        resp = sess.get(url, headers={"Referer": XIUNEWS_BASE + "/"}, timeout=timeout)
-        resp.raise_for_status()
-        final = getattr(resp, "url", url) or url
-        return _xiunews_decode(resp.content), str(final)
-    raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
-    return _xiunews_decode(raw), url
+def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2) -> tuple[str, str]:
+    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。
+
+    部分机房 / 住宅 IP 偶发连接超时（curl 28）；这里做有限次重试，失败后重置
+    会话再试，最大限度降低「章节加载失败: Connection timed out」的概率。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            sess = _xiunews_warm_session()
+            if sess is not None:
+                resp = sess.get(url, headers={"Referer": XIUNEWS_BASE + "/"}, timeout=timeout)
+                resp.raise_for_status()
+                final = getattr(resp, "url", url) or url
+                return _xiunews_decode(resp.content), str(final)
+            raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
+            return _xiunews_decode(raw), url
+        except Exception as exc:
+            last_exc = exc
+            # 超时 / 连接失败多半是会话或线路问题，重置会话后再试一次。
+            _xiunews_reset_session()
+            if attempt < retries:
+                time.sleep(0.6)
+    raise last_exc if last_exc else RuntimeError("xiunews fetch failed")
 
 
-def _xiunews_html(url: str, timeout: int = 15) -> str:
-    return _xiunews_fetch(url, timeout=timeout)[0]
+def _xiunews_html(url: str, timeout: int = 15, retries: int = 2) -> str:
+    return _xiunews_fetch(url, timeout=timeout, retries=retries)[0]
 
 
 def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[BookItem]:
@@ -1402,14 +1426,53 @@ def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[Book
     return items
 
 
+def _xiunews_cover(bid: str) -> str:
+    """抓取书页 og:image 作为封面（搜索结果页本身不含封面图）。"""
+    try:
+        html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/", timeout=8, retries=0)
+    except Exception:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    img = soup.find("meta", property="og:image")
+    return img.get("content", "").strip() if img and img.get("content") else ""
+
+
+def enrich_xiunews_covers(items: list[BookItem], deadline: float = 9.0) -> None:
+    """并发补全笔趣阁搜索结果的封面（搜索页无图，需访问各书页取 og:image）。
+
+    尽力而为：受 deadline 约束，超时未取到的书保留空封面（前端回退到占位首字），
+    避免个别慢书页拖垮整个搜索请求。
+    """
+    pending = [it for it in items if not it.cover]
+    if not pending:
+        return
+    pool = ThreadPoolExecutor(max_workers=min(8, len(pending)))
+    try:
+        futures = {pool.submit(_xiunews_cover, it.id): it for it in pending}
+        try:
+            for future in as_completed(futures, timeout=deadline):
+                item = futures[future]
+                try:
+                    item.cover = future.result() or item.cover
+                except Exception:
+                    pass
+        except TimeoutError:
+            pass  # 超出整体期限，放弃尚未完成的封面抓取
+    finally:
+        pool.shutdown(wait=False)
+
+
 def search_xiunews(keyword: str) -> list[BookItem]:
     # 站点搜索为 GET，searchkey 用 UTF-8 编码（站点已迁移到 UTF-8；旧代码误用 GBK 导致结果恒空）。
+    # 搜索页快速失败（retries=0），站点被拦时不要拖慢整个聚合搜索；重试只用于章节阅读。
     url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword)}"
     try:
-        html, final_url = _xiunews_fetch(url)
+        html, final_url = _xiunews_fetch(url, timeout=6, retries=0)
     except Exception:
         return []
-    return _parse_xiunews_results(html, final_url, keyword)
+    items = _parse_xiunews_results(html, final_url, keyword)
+    enrich_xiunews_covers(items, deadline=8.0)
+    return items
 
 
 def detail_xiunews(bid: str) -> dict[str, Any]:
@@ -1456,7 +1519,8 @@ def detail_xiunews(bid: str) -> dict[str, Any]:
 
 
 def _xiunews_chapter_text(bid: str, cid: str) -> tuple[str, list[str]]:
-    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html")
+    # 章节页用较短超时 + 一次重试（最多约 24s），避免站点拦截时长时间挂起。
+    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=1)
     soup = BeautifulSoup(html, "lxml")
     name = ""
     h1 = soup.find("h1")
@@ -1564,10 +1628,16 @@ def api_book_chapter():
         return jsonify({"error": f"该来源不支持站内阅读: {source}"}), 400
     if not book or not cid:
         return jsonify({"error": "缺少 book 或 id"}), 400
+    chapter_url = f"{XIUNEWS_BASE}/{book}/{cid}.html"
     try:
         return jsonify(chapter_xiunews(book, cid))
     except Exception as exc:
-        return jsonify({"error": f"章节加载失败: {exc}"}), 502
+        text = str(exc).lower()
+        if "timed out" in text or "curl: (28)" in text or "timeout" in text:
+            msg = "章节加载超时：笔趣阁偶发拦截服务器/本机 IP。可重试，或点下方按钮在原站阅读本章。"
+        else:
+            msg = f"章节加载失败：{exc}"
+        return jsonify({"error": msg, "chapterUrl": chapter_url}), 502
 
 
 @app.get("/api/book/download")

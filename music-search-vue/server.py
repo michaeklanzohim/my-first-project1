@@ -623,5 +623,289 @@ def api_proxy():
     return api_stream()
 
 
+# ===================== Video (zg01.inavs.cn, MacCMS) =====================
+
+ZG01_BASE = "https://zg01.inavs.cn"
+
+VIDEO_SITES = [
+    {"key": "zg01", "name": "zg01.inavs.cn", "url": ZG01_BASE + "/", "scrapable": True},
+    {
+        "key": "novipnoad",
+        "name": "novipnoad.ca",
+        "url": "https://www.novipnoad.ca/",
+        "scrapable": False,
+        "note": "Cloudflare 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+    {
+        "key": "dushe3",
+        "name": "dushe3.app",
+        "url": "https://www.dushe3.app/",
+        "scrapable": False,
+        "note": "cdndefend 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+    {
+        "key": "ymck",
+        "name": "ymck.pro",
+        "url": "https://www.ymck.pro/",
+        "scrapable": False,
+        "note": "Cloudflare 人机验证，服务器端无法抓取，请打开原站搜索",
+    },
+]
+
+
+@dataclass
+class VideoItem:
+    source: str
+    id: str
+    name: str
+    cover: str = ""
+    note: str = ""
+    type: str = ""
+    year: str = ""
+    area: str = ""
+
+
+def _node_text(node: Any) -> str:
+    return node.get_text(strip=True) if node else ""
+
+
+def _img_src(img: Any) -> str:
+    if not img:
+        return ""
+    return (img.get("data-original") or img.get("data-src") or img.get("src") or "").strip()
+
+
+def search_zg01(keyword: str) -> list[VideoItem]:
+    url = f"{ZG01_BASE}/vodsearch/{urllib.parse.quote(keyword)}-------------.html"
+    html = http_get(url, referer=ZG01_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    items: list[VideoItem] = []
+    seen: set[str] = set()
+    for card in soup.select(".module-card-item"):
+        anchor = card.select_one('a.module-card-item-poster[href^="/voddetail/"]') or card.select_one(
+            'a[href^="/voddetail/"]'
+        )
+        if not anchor:
+            continue
+        m = re.search(r"/voddetail/(\d+)\.html", anchor.get("href", ""))
+        if not m:
+            continue
+        vid = m.group(1)
+        if vid in seen:
+            continue
+        seen.add(vid)
+        img = card.select_one("img")
+        cover = _img_src(img)
+        name = _node_text(card.select_one(".module-card-item-title")) or (img.get("alt") if img else "") or ""
+        info = _node_text(card.select_one(".module-info-item-content"))
+        year_match = re.search(r"(?:19|20)\d{2}", info)
+        items.append(
+            VideoItem(
+                source="zg01",
+                id=vid,
+                name=name.strip(),
+                cover=cover,
+                note=_node_text(card.select_one(".module-item-note")),
+                type=_node_text(card.select_one(".module-card-item-class")),
+                year=year_match.group(0) if year_match else "",
+            )
+        )
+    return items[:40]
+
+
+def _player_data(html: str) -> dict[str, Any]:
+    m = re.search(r"player_aaaa\s*=\s*(\{.*?\})\s*</script>", html, re.S) or re.search(
+        r"player_aaaa\s*=\s*(\{.*?\});", html, re.S
+    )
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
+
+
+def _is_playable_url(url: str) -> bool:
+    return ".m3u8" in url or url.lower().endswith(".mp4")
+
+
+def _line_probe(vid: str, line: int) -> dict[str, Any]:
+    try:
+        html = http_get(f"{ZG01_BASE}/vodplay/{vid}-{line}-1.html", referer=ZG01_BASE + "/")
+        data = _player_data(html)
+        return {"from": data.get("from", ""), "playable": _is_playable_url(data.get("url", ""))}
+    except Exception:
+        return {"from": "", "playable": False}
+
+
+def detail_zg01(vid: str) -> dict[str, Any]:
+    from collections import OrderedDict
+
+    html = http_get(f"{ZG01_BASE}/voddetail/{vid}.html", referer=ZG01_BASE + "/")
+    soup = BeautifulSoup(html, "lxml")
+    name = _node_text(soup.select_one("h1"))
+    cover = _img_src(soup.select_one(".module-item-pic img")) or _img_src(soup.select_one("img.lazyload"))
+    desc = _node_text(
+        soup.select_one(".module-info-introduction-content")
+        or soup.select_one(".vod_content")
+        or soup.select_one("[class*=introduction]")
+    )
+
+    grouped: "OrderedDict[int, dict[int, str]]" = OrderedDict()
+    for a in soup.select(f'a[href*="/vodplay/{vid}-"]'):
+        mm = re.search(rf"/vodplay/{vid}-(\d+)-(\d+)\.html", a.get("href", ""))
+        if not mm:
+            continue
+        li, ep = int(mm.group(1)), int(mm.group(2))
+        grouped.setdefault(li, {})
+        if ep not in grouped[li]:
+            grouped[li][ep] = _node_text(a)
+
+    lines: list[dict[str, Any]] = []
+    if grouped:
+        with ThreadPoolExecutor(max_workers=min(4, len(grouped))) as pool:
+            probes = {li: pool.submit(_line_probe, vid, li) for li in grouped}
+            for li, eps in grouped.items():
+                try:
+                    meta = probes[li].result()
+                except Exception:
+                    meta = {"from": "", "playable": False}
+                episodes = [
+                    {"ep": ep, "name": (eps[ep] if eps[ep] and eps[ep] != "立即播放" else f"第{ep}集")}
+                    for ep in sorted(eps)
+                ]
+                lines.append(
+                    {
+                        "line": li,
+                        "from": meta.get("from", ""),
+                        "playable": meta.get("playable", False),
+                        "count": len(episodes),
+                        "episodes": episodes,
+                    }
+                )
+
+    return {
+        "source": "zg01",
+        "id": vid,
+        "name": name,
+        "cover": cover,
+        "desc": desc,
+        "pageUrl": f"{ZG01_BASE}/voddetail/{vid}.html",
+        "lines": lines,
+    }
+
+
+def parse_zg01(vid: str, line: int, ep: int) -> dict[str, Any]:
+    page_url = f"{ZG01_BASE}/vodplay/{vid}-{line}-{ep}.html"
+    data = _player_data(http_get(page_url, referer=ZG01_BASE + "/"))
+    url = data.get("url", "")
+    return {
+        "from": data.get("from", ""),
+        "url": url,
+        "isM3u8": ".m3u8" in url,
+        "isMp4": url.lower().endswith(".mp4"),
+        "playable": _is_playable_url(url),
+        "pageUrl": page_url,
+    }
+
+
+def _proxy_seg(absolute_url: str, referer: str) -> str:
+    return "/api/video/stream?" + urllib.parse.urlencode({"url": absolute_url, "referer": referer})
+
+
+def _rewrite_m3u8(text: str, base_url: str, referer: str) -> str:
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            if "URI=" in stripped:
+                stripped = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda m: 'URI="' + _proxy_seg(urllib.parse.urljoin(base_url, m.group(1)), referer) + '"',
+                    stripped,
+                )
+            out.append(stripped)
+            continue
+        out.append(_proxy_seg(urllib.parse.urljoin(base_url, stripped), referer))
+    return "\n".join(out)
+
+
+@app.get("/api/video/sites")
+def api_video_sites():
+    return jsonify({"sites": VIDEO_SITES})
+
+
+@app.get("/api/video/search")
+def api_video_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "缺少搜索关键词"}), 400
+    blocked = [s for s in VIDEO_SITES if not s["scrapable"]]
+    try:
+        items = search_zg01(q)
+    except Exception as exc:
+        return jsonify({"query": q, "count": 0, "items": [], "blocked": blocked, "error": f"zg01 搜索失败：{exc}"})
+    return jsonify(
+        {"query": q, "count": len(items), "items": [asdict(x) for x in items], "blocked": blocked}
+    )
+
+
+@app.get("/api/video/detail")
+def api_video_detail():
+    vid = (request.args.get("id") or "").strip()
+    source = (request.args.get("source") or "zg01").lower()
+    if not vid:
+        return jsonify({"error": "缺少 id"}), 400
+    if source != "zg01":
+        return jsonify({"error": f"暂不支持来源: {source}"}), 400
+    try:
+        return jsonify(detail_zg01(vid))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/video/parse")
+def api_video_parse():
+    vid = (request.args.get("id") or "").strip()
+    source = (request.args.get("source") or "zg01").lower()
+    if not vid:
+        return jsonify({"error": "缺少 id"}), 400
+    if source != "zg01":
+        return jsonify({"error": f"暂不支持来源: {source}"}), 400
+    try:
+        return jsonify(parse_zg01(vid, int(request.args.get("line", "1")), int(request.args.get("ep", "1"))))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/video/stream")
+def api_video_stream():
+    target = request.args.get("url", "")
+    referer = request.args.get("referer", ZG01_BASE + "/")
+    if not (target.startswith("http://") or target.startswith("https://")):
+        return jsonify({"error": "无效链接"}), 400
+    hdrs = {"User-Agent": UA, "Accept": "*/*", "Accept-Language": "zh-CN,zh;q=0.9"}
+    if referer:
+        hdrs["Referer"] = referer
+    try:
+        if HAS_CFFI:
+            resp = cffi_requests.get(target, headers=hdrs, impersonate="chrome124", timeout=30)
+            status, content, ctype = resp.status_code, resp.content, resp.headers.get("Content-Type", "")
+        else:
+            req = urllib.request.Request(target, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status, content, ctype = resp.status, resp.read(), resp.headers.get("Content-Type", "")
+    except Exception as exc:
+        return jsonify({"error": f"拉取失败: {exc}"}), 502
+
+    if status == 200 and content.lstrip(b"\xef\xbb\xbf").lstrip()[:7] == b"#EXTM3U":
+        rewritten = _rewrite_m3u8(content.decode("utf-8", "ignore"), target, referer)
+        return Response(rewritten, status=status, mimetype="application/vnd.apple.mpegurl")
+    return Response(content, status=status, content_type=ctype or "application/octet-stream")
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5178, debug=True)

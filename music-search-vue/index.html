@@ -106,6 +106,9 @@
     }
     .btn.primary { background: linear-gradient(135deg, var(--accent2), #2aa7ff); border: none; color: #fff; cursor: pointer; }
     .btn.primary:disabled { opacity: 0.65; cursor: not-allowed; }
+    .btn.quality-select { cursor: pointer; appearance: none; -webkit-appearance: none; padding-right: 28px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%239fb0d9'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 10px center; }
     .empty, .error, .hint {
       padding: 24px 16px; color: var(--sub); text-align: center;
     }
@@ -205,13 +208,20 @@
           <p v-else class="hint">未获取到可播链接，可尝试下载或打开原站页面。</p>
 
           <div class="actions">
+            <select
+              v-if="qualities.length"
+              v-model="selectedQualityUrl"
+              class="btn quality-select"
+              :title="'选择音质'"
+            >
+              <option v-for="q in qualities" :key="q.url" :value="q.url">{{ q.label }}</option>
+            </select>
             <button
-              v-if="canDownload"
+              v-if="qualities.length"
               class="btn primary"
               :disabled="downloading"
               @click="downloadMusic"
-            >{{ downloading ? '下载中...' : '下载音乐' }}</button>
-            <a v-if="detail.panUrl" class="btn" :href="detail.panUrl" target="_blank" rel="noopener">网盘链接</a>
+            >{{ downloading ? '下载中...' : (selectedQuality && selectedQuality.kind === 'pan' ? '去网盘下载' : '下载') }}</button>
             <a v-if="detail.pageUrl" class="btn" :href="detail.pageUrl" target="_blank" rel="noopener">原站页面</a>
           </div>
         </template>
@@ -221,7 +231,7 @@
 
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <script>
-    const { createApp, ref, computed, nextTick } = Vue;
+    const { createApp, ref, computed, watch, nextTick } = Vue;
 
     createApp({
       setup() {
@@ -262,6 +272,16 @@
         const rawAudioUrl = computed(() => detail.value.playUrl || detail.value.downloadUrl || "");
         const audioSrc = computed(() => streamUrl(rawAudioUrl.value, detail.value.pageUrl || ""));
         const canDownload = computed(() => isDirectAudio(rawAudioUrl.value));
+
+        const qualities = computed(() => detail.value.qualities || []);
+        const selectedQualityUrl = ref("");
+        watch(detail, () => {
+          const qs = detail.value.qualities || [];
+          selectedQualityUrl.value = qs.length ? qs[0].url : "";
+        });
+        const selectedQuality = computed(
+          () => qualities.value.find((q) => q.url === selectedQualityUrl.value) || null
+        );
 
         const fetchSongDetail = async (song, refresh = false) => {
           detailLoading.value = true;
@@ -337,13 +357,18 @@
         };
 
         const downloadMusic = async () => {
-          const url = rawAudioUrl.value;
-          if (!isDirectAudio(url) || !current.value) return;
+          const tier = selectedQuality.value;
+          if (!tier || !current.value) return;
+          if (tier.kind === "pan") {
+            window.open(tier.url, "_blank", "noopener");
+            return;
+          }
           downloading.value = true;
           error.value = "";
-          const filename = `${detail.value.name || current.value.name}-${detail.value.artist || current.value.artist || "未知"}.mp3`;
+          const ext = tier.format || "mp3";
+          const filename = `${detail.value.name || current.value.name}-${detail.value.artist || current.value.artist || "未知"}.${ext}`;
           const q = new URLSearchParams({
-            url,
+            url: tier.url,
             referer: detail.value.pageUrl || "",
             filename,
           });
@@ -372,6 +397,7 @@
         return {
           keyword, source, items, current, detail, loading, detailLoading, downloading,
           error, fangpiMeta, audioRef, placeholder, sourceLabel, audioSrc, canDownload,
+          qualities, selectedQualityUrl, selectedQuality,
           search, playSong, onAudioError, downloadMusic,
         };
       },

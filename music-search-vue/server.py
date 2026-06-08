@@ -290,6 +290,30 @@ def search_gequhai(keyword: str) -> list[SongItem]:
     return items
 
 
+def build_qualities(
+    *,
+    direct_mp3: str = "",
+    flac_pan: str = "",
+    mp3_pan: str = "",
+    generic_pan: str = "",
+) -> list[dict[str, Any]]:
+    """Assemble quality/download tiers, highest quality first.
+
+    kind='direct' -> in-app proxy download; kind='pan' -> open netdisk share link.
+    True lossless is only distributed via netdisk (kuwo gates FLAC behind VIP).
+    """
+    tiers: list[dict[str, Any]] = []
+    if flac_pan:
+        tiers.append({"label": "无损 FLAC（网盘）", "format": "flac", "lossless": True, "kind": "pan", "url": flac_pan})
+    if direct_mp3 and is_direct_audio(direct_mp3):
+        tiers.append({"label": "标准 MP3（直链下载）", "format": "mp3", "lossless": False, "kind": "direct", "url": direct_mp3})
+    if mp3_pan:
+        tiers.append({"label": "标准 MP3（网盘）", "format": "mp3", "lossless": False, "kind": "pan", "url": mp3_pan})
+    if generic_pan and not flac_pan and not mp3_pan:
+        tiers.append({"label": "原盘下载（网盘）", "format": "", "lossless": False, "kind": "pan", "url": generic_pan})
+    return tiers
+
+
 def detail_gequhai(song_id: str) -> dict[str, Any]:
     page_url = f"https://www.gequhai.com/play/{song_id}"
     html = http_get(page_url, referer="https://www.gequhai.com/")
@@ -330,6 +354,7 @@ def detail_gequhai(song_id: str) -> dict[str, Any]:
         "playUrl": play_url,
         "downloadUrl": play_url or pan_url,
         "panUrl": pan_url,
+        "qualities": build_qualities(direct_mp3=play_url, generic_pan=pan_url),
         "pageUrl": page_url,
     }
 
@@ -371,7 +396,8 @@ def detail_yyfang(song_id: str) -> dict[str, Any]:
     data = parse_yyfang_detail_json(html)
     play_url = data.get("music_mp3Url") or data.get("music_mp3url") or ""
     flac_url = data.get("music_flacUrl") or data.get("music_flacurl") or ""
-    pan_url = data.get("mp3_url") or ""
+    mp3_pan = data.get("mp3_url") or ""
+    flac_pan = data.get("flac_url") or ""
     if play_url:
         play_url = convert_kuwo_url(play_url)
     if flac_url:
@@ -387,9 +413,10 @@ def detail_yyfang(song_id: str) -> dict[str, Any]:
         "artist": data.get("music_artist", ""),
         "cover": data.get("music_cover", ""),
         "playUrl": play_url,
-        "downloadUrl": play_url or flac_url or pan_url,
+        "downloadUrl": play_url or flac_url or mp3_pan,
         "flacUrl": flac_url,
-        "panUrl": pan_url,
+        "panUrl": mp3_pan,
+        "qualities": build_qualities(direct_mp3=play_url, flac_pan=flac_pan, mp3_pan=mp3_pan),
         "pageUrl": page_url,
     }
 
@@ -487,6 +514,7 @@ def detail_fangpi(song_id: str) -> dict[str, Any]:
         "playUrl": play_url,
         "downloadUrl": play_url or pan_url,
         "panUrl": pan_url,
+        "qualities": build_qualities(direct_mp3=play_url, generic_pan=pan_url),
         "lyric": lyric_el.get_text("\n", strip=True) if lyric_el else "",
         "pageUrl": page_url,
     }

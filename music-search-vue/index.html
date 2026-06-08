@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>音乐搜索 · 三站聚合</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a31;
+      --line: rgba(120, 160, 255, 0.18);
+      --text: #e8eeff;
+      --sub: #9fb0d9;
+      --accent: #5b8cff;
+      --accent2: #35d0ba;
+      --danger: #ff6b8a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at 10% 10%, #1a2b63 0%, transparent 35%),
+        radial-gradient(circle at 90% 20%, #12324a 0%, transparent 30%),
+        var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 18px 40px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .sub { color: var(--sub); margin-bottom: 22px; }
+    .search-bar {
+      display: grid;
+      grid-template-columns: 1fr 140px 160px;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    input, select, button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 15px;
+    }
+    button {
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), #7a5cff);
+      border: none;
+      font-weight: 600;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+    }
+    .card {
+      background: rgba(18, 26, 49, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+    }
+    .card-hd {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--sub);
+      font-size: 14px;
+    }
+    .list { max-height: 62vh; overflow: auto; }
+    .item {
+      display: grid;
+      grid-template-columns: 52px 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .item:hover, .item.active { background: rgba(91, 140, 255, 0.12); }
+    .cover {
+      width: 52px; height: 52px; border-radius: 10px;
+      object-fit: cover; background: #1f2a49;
+    }
+    .name { font-weight: 600; margin-bottom: 4px; }
+    .meta { color: var(--sub); font-size: 13px; }
+    .tag {
+      font-size: 12px; padding: 4px 8px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--sub); white-space: nowrap;
+    }
+    .player { padding: 18px; }
+    .player-top { display: flex; gap: 14px; align-items: center; margin-bottom: 16px; }
+    .player-cover { width: 96px; height: 96px; border-radius: 14px; object-fit: cover; background: #1f2a49; }
+    .player-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+    .player-artist { color: var(--sub); }
+    audio { width: 100%; margin: 12px 0 16px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .btn {
+      padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line);
+      background: #18223f; color: var(--text); text-decoration: none; font-size: 14px;
+    }
+    .btn.primary { background: linear-gradient(135deg, var(--accent2), #2aa7ff); border: none; color: #fff; cursor: pointer; }
+    .btn.primary:disabled { opacity: 0.65; cursor: not-allowed; }
+    .empty, .error, .hint {
+      padding: 24px 16px; color: var(--sub); text-align: center;
+    }
+    .error { color: var(--danger); }
+    .iframe-box { height: 62vh; border: 0; width: 100%; background: #fff; }
+    .sources {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;
+    }
+    .pill {
+      padding: 6px 10px; border-radius: 999px; font-size: 12px;
+      border: 1px solid var(--line); color: var(--sub);
+    }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .search-bar { grid-template-columns: 1fr; }
+      .list, .iframe-box { max-height: 45vh; height: 45vh; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="wrap">
+    <h1>音乐搜索聚合</h1>
+    <p class="sub">聚合歌曲海 · 音乐坊 · 放屁网 — 搜索、在线播放、下载</p>
+
+    <div class="search-bar">
+      <input v-model="keyword" placeholder="输入歌名或歌手，例如：晴天" @keyup.enter="search" />
+      <select v-model="source">
+        <option value="all">全部来源</option>
+        <option value="gequhai">歌曲海 gequhai.com</option>
+        <option value="yyfang">音乐坊 yyfang.top</option>
+        <option value="fangpi">放屁网 fangpi.net</option>
+      </select>
+      <button :disabled="loading || !keyword.trim()" @click="search">
+        {{ loading ? '搜索中...' : '搜索' }}
+      </button>
+    </div>
+
+    <div class="sources">
+      <span class="pill">歌曲海：HTML + /api/music</span>
+      <span class="pill">音乐坊：详情 JSON 直链</span>
+      <span class="pill">放屁网：嵌入页 / API（视网络环境）</span>
+    </div>
+
+    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="fangpiMeta.message" class="hint">{{ fangpiMeta.message }}</p>
+
+    <div class="layout">
+      <section class="card">
+        <div class="card-hd">
+          <span>搜索结果</span>
+          <span>{{ items.length }} 条</span>
+        </div>
+        <div v-if="source === 'fangpi' && fangpiMeta.iframeUrl && !items.length" class="list">
+          <iframe class="iframe-box" :src="fangpiMeta.iframeUrl" title="放屁网搜索"></iframe>
+        </div>
+        <div v-else-if="!items.length && !loading" class="empty">输入关键词开始搜索</div>
+        <div v-else class="list">
+          <div
+            v-for="song in items"
+            :key="song.source + song.id"
+            class="item"
+            :class="{ active: current?.id === song.id && current?.source === song.source }"
+            @click="playSong(song)"
+          >
+            <img class="cover" :src="song.cover || placeholder" alt="" />
+            <div>
+              <div class="name">{{ song.name }}</div>
+              <div class="meta">{{ song.artist || '未知歌手' }}</div>
+            </div>
+            <span class="tag">{{ sourceLabel(song.source) }}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card player">
+        <div v-if="!current" class="empty">选择一首歌曲播放</div>
+        <template v-else>
+          <div class="player-top">
+            <img class="player-cover" :src="detail.cover || placeholder" alt="" />
+            <div>
+              <div class="player-title">{{ detail.name || current.name }}</div>
+              <div class="player-artist">{{ detail.artist || current.artist }}</div>
+              <div class="meta" style="margin-top:8px;">来源：{{ sourceLabel(current.source) }}</div>
+            </div>
+          </div>
+
+          <audio
+            v-if="audioSrc"
+            :key="audioSrc"
+            ref="audioRef"
+            :src="audioSrc"
+            controls
+            preload="auto"
+            @error="onAudioError"
+          ></audio>
+          <p v-else-if="detailLoading" class="hint">正在获取播放链接...</p>
+          <p v-else class="hint">未获取到可播链接，可尝试下载或打开原站页面。</p>
+
+          <div class="actions">
+            <button
+              v-if="canDownload"
+              class="btn primary"
+              :disabled="downloading"
+              @click="downloadMusic"
+            >{{ downloading ? '下载中...' : '下载音乐' }}</button>
+            <a v-if="detail.panUrl" class="btn" :href="detail.panUrl" target="_blank" rel="noopener">网盘链接</a>
+            <a v-if="detail.pageUrl" class="btn" :href="detail.pageUrl" target="_blank" rel="noopener">原站页面</a>
+          </div>
+        </template>
+      </section>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script>
+    const { createApp, ref, computed, nextTick } = Vue;
+
+    createApp({
+      setup() {
+        const keyword = ref("");
+        const source = ref("all");
+        const items = ref([]);
+        const current = ref(null);
+        const detail = ref({});
+        const loading = ref(false);
+        const detailLoading = ref(false);
+        const downloading = ref(false);
+        const error = ref("");
+        const fangpiMeta = ref({});
+        const audioRef = ref(null);
+        const placeholder = "data:image/svg+xml," + encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96"><rect width="100%" height="100%" fill="#243156"/><text x="50%" y="54%" fill="#9fb0d9" font-size="12" text-anchor="middle">MUSIC</text></svg>'
+        );
+
+        const sourceLabel = (s) => ({
+          gequhai: "歌曲海",
+          yyfang: "音乐坊",
+          fangpi: "放屁网",
+        }[s] || s);
+
+        const isDirectAudio = (url) => {
+          if (!url) return false;
+          const lower = url.toLowerCase();
+          if (lower.includes("pan.") || lower.includes("quark.cn")) return false;
+          return /\.(mp3|flac|m4a|wav|ogg)(\?|$)/.test(lower) || lower.includes("kuwo.cn");
+        };
+
+        const streamUrl = (url, referer = "") => {
+          if (!isDirectAudio(url)) return "";
+          const q = new URLSearchParams({ url, referer });
+          return `/api/stream?${q.toString()}`;
+        };
+
+        const rawAudioUrl = computed(() => detail.value.playUrl || detail.value.downloadUrl || "");
+        const audioSrc = computed(() => streamUrl(rawAudioUrl.value, detail.value.pageUrl || ""));
+        const canDownload = computed(() => isDirectAudio(rawAudioUrl.value));
+
+        const fetchSongDetail = async (song, refresh = false) => {
+          detailLoading.value = true;
+          try {
+            const res = await fetch(
+              `/api/song?source=${song.source}&id=${encodeURIComponent(song.id)}${refresh ? "&refresh=1" : ""}`
+            );
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "获取歌曲失败");
+            detail.value = data;
+            if (!isDirectAudio(data.playUrl) && !isDirectAudio(data.downloadUrl)) {
+              error.value = data.panUrl
+                ? "暂无直链，可使用网盘链接下载。"
+                : "该歌曲暂无直链，可打开原站页面。";
+            }
+            await nextTick();
+            if (audioRef.value && audioSrc.value) {
+              audioRef.value.load();
+              audioRef.value.play().catch(() => {});
+            }
+          } finally {
+            detailLoading.value = false;
+          }
+        };
+
+        const search = async () => {
+          const q = keyword.value.trim();
+          if (!q) return;
+          loading.value = true;
+          error.value = "";
+          items.value = [];
+          fangpiMeta.value = {};
+          current.value = null;
+          detail.value = {};
+          try {
+            const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&source=${source.value}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "搜索失败");
+            items.value = data.items || [];
+            fangpiMeta.value = data.fangpi || {};
+            if (!items.value.length && source.value !== "fangpi") {
+              error.value = "没有找到相关歌曲，换个关键词试试。";
+            }
+          } catch (e) {
+            error.value = e.message || String(e);
+          } finally {
+            loading.value = false;
+          }
+        };
+
+        const playSong = async (song) => {
+          current.value = song;
+          detail.value = { name: song.name, artist: song.artist, cover: song.cover };
+          error.value = "";
+          try {
+            await fetchSongDetail(song);
+          } catch (e) {
+            error.value = e.message || String(e);
+          }
+        };
+
+        const onAudioError = async () => {
+          if (!current.value) return;
+          error.value = "播放失败，正在刷新链接重试...";
+          try {
+            await fetchSongDetail(current.value, true);
+            error.value = "";
+          } catch (e) {
+            error.value = detail.value.panUrl
+              ? "在线播放失败，请尝试下载或使用网盘链接。"
+              : "音频加载失败，链接可能已过期。";
+          }
+        };
+
+        const downloadMusic = async () => {
+          const url = rawAudioUrl.value;
+          if (!isDirectAudio(url) || !current.value) return;
+          downloading.value = true;
+          error.value = "";
+          const filename = `${detail.value.name || current.value.name}-${detail.value.artist || current.value.artist || "未知"}.mp3`;
+          const q = new URLSearchParams({
+            url,
+            referer: detail.value.pageUrl || "",
+            filename,
+          });
+          try {
+            const res = await fetch(`/api/download?${q.toString()}`);
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || `下载失败 (${res.status})`);
+            }
+            const blob = await res.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = objectUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(objectUrl);
+          } catch (e) {
+            error.value = e.message || String(e);
+          } finally {
+            downloading.value = false;
+          }
+        };
+
+        return {
+          keyword, source, items, current, detail, loading, detailLoading, downloading,
+          error, fangpiMeta, audioRef, placeholder, sourceLabel, audioSrc, canDownload,
+          search, playSong, onAudioError, downloadMusic,
+        };
+      },
+    }).mount("#app");
+  </script>
+</body>
+</html>

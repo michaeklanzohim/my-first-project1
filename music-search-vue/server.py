@@ -809,6 +809,105 @@ def parse_zg01(vid: str, line: int, ep: int) -> dict[str, Any]:
     }
 
 
+# ---- 免费采集 API（MacCMS JSON，?ac=detail&wd= 直接返回含 m3u8 的播放地址）----
+VIDEO_API_SITES = [
+    {"key": "ffzy", "name": "非凡", "api": "https://ffzy5.tv/api.php/provide/vod"},
+    {"key": "bfzy", "name": "暴风", "api": "https://bfzyapi.com/api.php/provide/vod"},
+    {"key": "rycj", "name": "如意", "api": "https://cj.rycjapi.com/api.php/provide/vod"},
+    {"key": "dyttzy", "name": "天堂", "api": "http://caiji.dyttzyapi.com/api.php/provide/vod"},
+    {"key": "jisu", "name": "极速", "api": "https://jszyapi.com/api.php/provide/vod"},
+    {"key": "zuid", "name": "最大", "api": "https://api.zuidapi.com/api.php/provide/vod"},
+]
+API_SITE_BY_KEY = {s["key"]: s for s in VIDEO_API_SITES}
+
+
+def _video_api_get(api: str, params: dict[str, Any]) -> dict[str, Any]:
+    if HAS_CFFI:
+        resp = cffi_requests.get(
+            api, params=params, headers={"User-Agent": UA}, impersonate="chrome124", timeout=15, verify=False
+        )
+        return resp.json()
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(f"{api}?{urllib.parse.urlencode(params)}", headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+
+def search_maccms(site: dict[str, str], keyword: str) -> list[VideoItem]:
+    try:
+        data = _video_api_get(site["api"], {"ac": "detail", "wd": keyword, "pg": 1})
+    except Exception:
+        return []
+    items: list[VideoItem] = []
+    for v in (data.get("list") or [])[:20]:
+        vid = str(v.get("vod_id", "")).strip()
+        if not vid:
+            continue
+        items.append(
+            VideoItem(
+                source=site["key"],
+                id=vid,
+                name=(v.get("vod_name") or "").strip(),
+                cover=(v.get("vod_pic") or "").strip(),
+                note=(v.get("vod_remarks") or "").strip(),
+                type=(v.get("type_name") or "").strip(),
+                year=str(v.get("vod_year") or "").strip(),
+                area=(v.get("vod_area") or "").strip(),
+            )
+        )
+    return items
+
+
+def _parse_maccms_play(vod: dict[str, Any]) -> list[dict[str, Any]]:
+    froms = (vod.get("vod_play_from") or "").split("$$$")
+    groups = (vod.get("vod_play_url") or "").split("$$$")
+    lines: list[dict[str, Any]] = []
+    for i, group in enumerate(groups):
+        episodes: list[dict[str, Any]] = []
+        for idx, seg in enumerate(group.split("#"), 1):
+            seg = seg.strip()
+            if not seg:
+                continue
+            name, url = seg.split("$", 1) if "$" in seg else (f"第{idx}集", seg)
+            url = url.strip()
+            if not url:
+                continue
+            episodes.append({"ep": len(episodes) + 1, "name": name.strip() or f"第{idx}集",
+                             "url": url, "playable": ".m3u8" in url})
+        if not episodes:
+            continue
+        lines.append({
+            "line": i + 1,
+            "from": (froms[i] if i < len(froms) else f"线路{i + 1}").strip(),
+            "playable": any(e["playable"] for e in episodes),
+            "count": len(episodes),
+            "episodes": episodes,
+        })
+    return lines
+
+
+def detail_maccms(site: dict[str, str], vid: str) -> dict[str, Any]:
+    data = _video_api_get(site["api"], {"ac": "detail", "ids": vid})
+    lst = data.get("list") or []
+    if not lst:
+        raise RuntimeError("未找到该影视详情")
+    v = lst[0]
+    desc = re.sub(r"<[^>]+>", "", v.get("vod_blurb") or v.get("vod_content") or "").strip()
+    return {
+        "source": site["key"],
+        "id": str(vid),
+        "name": (v.get("vod_name") or "").strip(),
+        "cover": (v.get("vod_pic") or "").strip(),
+        "desc": desc,
+        "pageUrl": "",
+        "lines": _parse_maccms_play(v),
+    }
+
+
 def _proxy_seg(absolute_url: str, referer: str) -> str:
     return "/api/video/stream?" + urllib.parse.urlencode({"url": absolute_url, "referer": referer})
 
@@ -844,12 +943,38 @@ def api_video_search():
     if not q:
         return jsonify({"error": "缺少搜索关键词"}), 400
     blocked = [s for s in VIDEO_SITES if not s["scrapable"]]
-    try:
-        items = search_zg01(q)
-    except Exception as exc:
-        return jsonify({"query": q, "count": 0, "items": [], "blocked": blocked, "error": f"zg01 搜索失败：{exc}"})
+
+    tasks: dict[str, Any] = {"zg01": (lambda: search_zg01(q))}
+    for s in VIDEO_API_SITES:
+        tasks[s["key"]] = (lambda site=s: search_maccms(site, q))
+
+    results: dict[str, list[VideoItem]] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {k: pool.submit(fn) for k, fn in tasks.items()}
+        for k, f in futs.items():
+            try:
+                results[k] = f.result()
+            except Exception:
+                results[k] = []
+
+    # 交错合并各来源结果，避免单一来源刷屏
+    ordered_keys = ["zg01"] + [s["key"] for s in VIDEO_API_SITES]
+    items: list[VideoItem] = []
+    i = 0
+    while True:
+        added = False
+        for k in ordered_keys:
+            lst = results.get(k, [])
+            if i < len(lst):
+                items.append(lst[i])
+                added = True
+        if not added:
+            break
+        i += 1
+
+    sources = [{"key": "zg01", "name": "zg01"}] + [{"key": s["key"], "name": s["name"]} for s in VIDEO_API_SITES]
     return jsonify(
-        {"query": q, "count": len(items), "items": [asdict(x) for x in items], "blocked": blocked}
+        {"query": q, "count": len(items), "items": [asdict(x) for x in items], "blocked": blocked, "sources": sources}
     )
 
 
@@ -859,10 +984,13 @@ def api_video_detail():
     source = (request.args.get("source") or "zg01").lower()
     if not vid:
         return jsonify({"error": "缺少 id"}), 400
-    if source != "zg01":
-        return jsonify({"error": f"暂不支持来源: {source}"}), 400
     try:
-        return jsonify(detail_zg01(vid))
+        if source == "zg01":
+            return jsonify(detail_zg01(vid))
+        site = API_SITE_BY_KEY.get(source)
+        if not site:
+            return jsonify({"error": f"暂不支持来源: {source}"}), 400
+        return jsonify(detail_maccms(site, vid))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 

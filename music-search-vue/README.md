@@ -8,10 +8,13 @@
 - [音乐坊 yyfang.top](https://yyfang.top/)
 - [放屁网 fangpi.net](https://www.fangpi.net/)
 
-**视频**——zg01 影视综合搜索 + 选集在线播放（m3u8 直链用 hls.js 播放）：
+**视频**——多源聚合影视综合搜索 + 选集在线播放（m3u8 直链用 hls.js 播放）：
 
-- [zg01.inavs.cn](https://zg01.inavs.cn/)：可搜索、拿剧集、在线播放
+- [zg01.inavs.cn](https://zg01.inavs.cn/)：HTML 站，可搜索、拿剧集、在线播放
+- 免费采集 API（MacCMS JSON，`?ac=detail&wd=` 直接返回含 m3u8 的播放地址）：非凡 / 暴风 / 如意 / 天堂 / 极速 / 最大 等
 - novipnoad.ca / dushe3.app / ymck.pro：有人机验证（Cloudflare / cdndefend），服务器端无法抓取，仅提供「打开原站」入口
+
+> 多个来源会并发搜索、结果交错合并，每个海报右上角标注来源。不同源走不同 CDN，某条线路被拦时可换其它来源/线路。**不做任何 VIP 破解**——只聚合本身免费、可直链的资源；腾讯/优酷/爱奇艺等会员外链只提供「打开原站」按钮。
 
 ## 启动
 
@@ -67,12 +70,11 @@ music-search-vue/
 - 音乐坊：搜索 `/search`，详情页内嵌 JSON 含 `music_mp3Url`
 - 放屁网：服务器端可能被 403，此时使用 iframe 嵌入原站搜索
 
-视频（zg01，MacCMS 站）：
+视频：
 
-- 搜索：`/vodsearch/关键词-------------.html`
-- 详情：`/voddetail/{id}.html`，抓取剧集列表并按线路分组
-- 播放页：`/vodplay/{id}-{线路}-{集}.html`，从内嵌 `player_aaaa` JSON 取 `url`
-- 后端接口：`/api/video/search`、`/api/video/detail`、`/api/video/parse`、`/api/video/stream`（m3u8 代理 + 分片改写）
+- zg01（HTML 站）：搜索 `/vodsearch/关键词-------------.html`；详情 `/voddetail/{id}.html` 抓剧集；播放页 `/vodplay/{id}-{线路}-{集}.html` 从内嵌 `player_aaaa` JSON 取 `url`
+- 免费采集 API（MacCMS JSON）：搜索 `{api}?ac=detail&wd=关键词`；详情 `{api}?ac=detail&ids={id}`，从 `vod_play_from`（线路，`$$$` 分隔）+ `vod_play_url`（每集 `名称$地址`，`#` 分隔）解析出每条线路的剧集与 m3u8 直链
+- 后端接口：`/api/video/search`（并发聚合所有来源）、`/api/video/detail`、`/api/video/parse`（仅 zg01 需要）、`/api/video/stream`（m3u8 代理 + 分片改写）
 
 ## 常见问题
 

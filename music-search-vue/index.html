@@ -145,6 +145,7 @@
     }
     .poster-name { font-size: 13px; font-weight: 600; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .poster-meta { font-size: 12px; color: var(--sub); }
+    .poster-badge { position: absolute; top: 6px; left: 6px; background: rgba(20,28,54,.85); color: #cfe0ff; font-size: 11px; padding: 1px 6px; border-radius: 6px; }
     .video-el { width: 100%; border-radius: 12px; background: #000; aspect-ratio: 16/9; margin-bottom: 12px; }
     .lines { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
     .episodes {
@@ -168,7 +169,7 @@
   <div id="app" class="wrap">
     <h1>{{ mode === 'music' ? '音乐搜索聚合' : '视频搜索聚合' }}</h1>
     <p class="sub" v-if="mode === 'music'">聚合歌曲海 · 音乐坊 · 放屁网 — 搜索、在线播放、下载</p>
-    <p class="sub" v-else>聚合 zg01 影视 — 综合搜索、选集、在线播放（m3u8 直链）</p>
+    <p class="sub" v-else>多源聚合影视搜索 — zg01 + 多个免费采集站，选集在线播放（m3u8 直链 hls.js）</p>
 
     <div class="tabs">
       <button :class="{ active: mode === 'music' }" @click="switchMode('music')">音乐</button>
@@ -314,6 +315,7 @@
               @click="openVideo(v)"
             >
               <img :src="v.cover || vPlaceholder" alt="" referrerpolicy="no-referrer" />
+              <span class="poster-badge">{{ vSourceName(v.source) }}</span>
               <span v-if="v.note" class="poster-note">{{ v.note }}</span>
               <div class="poster-name" :title="v.name">{{ v.name }}</div>
               <div class="poster-meta">{{ [v.type, v.year].filter(Boolean).join(' · ') }}</div>
@@ -324,7 +326,7 @@
         <section class="card player">
           <div v-if="!vCurrent" class="empty">选择一部影视播放</div>
           <template v-else>
-            <div class="player-title" style="margin-bottom:10px;">{{ vDetail.name || vCurrent.name }}</div>
+            <div class="player-title" style="margin-bottom:10px;">{{ vDetail.name || vCurrent.name }}<span style="font-size:12px;color:var(--sub);margin-left:8px;">来源：{{ vSourceName(vCurrent.source) }}</span></div>
             <p v-if="vDetailLoading" class="hint">正在加载剧集...</p>
 
             <video ref="videoRef" class="video-el" controls playsinline></video>
@@ -354,7 +356,7 @@
                 class="ep-btn"
                 :class="{ active: vEp === e.ep }"
                 :title="e.name"
-                @click="playEpisode(e.ep)"
+                @click="playEpisode(e)"
               >{{ e.name }}</button>
             </div>
 
@@ -537,9 +539,10 @@
         };
 
         // ---------------- 视频 ----------------
-        const VIDEO_REFERER = "https://zg01.inavs.cn/";
         const vKeyword = ref("");
         const vItems = ref([]);
+        const vSources = ref({ zg01: "zg01" });
+        const vSourceName = (key) => vSources.value[key] || key || "";
         const vBlocked = ref([]);
         const vLoading = ref(false);
         const vError = ref("");
@@ -559,8 +562,9 @@
 
         const curLine = computed(() => (vDetail.value.lines || [])[vLineIdx.value] || null);
 
-        const proxiedVideo = (url) =>
-          "/api/video/stream?" + new URLSearchParams({ url, referer: VIDEO_REFERER }).toString();
+        const refererFor = (src) => (src === "zg01" ? "https://zg01.inavs.cn/" : "");
+        const proxiedVideo = (url, src) =>
+          "/api/video/stream?" + new URLSearchParams({ url, referer: refererFor(src) }).toString();
 
         const destroyVideo = () => {
           if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
@@ -587,6 +591,11 @@
             const res = await fetch(`/api/video/search?q=${encodeURIComponent(q)}`);
             const data = await res.json();
             vBlocked.value = data.blocked || [];
+            if (Array.isArray(data.sources)) {
+              const map = {};
+              data.sources.forEach((s) => { map[s.key] = s.name; });
+              vSources.value = map;
+            }
             if (!res.ok) throw new Error(data.error || "搜索失败");
             vItems.value = data.items || [];
             if (data.error) vError.value = data.error;
@@ -617,7 +626,7 @@
             let idx = lines.findIndex((l) => l.playable);
             vLineIdx.value = idx < 0 ? 0 : idx;
             if (curLine.value && curLine.value.episodes.length) {
-              playEpisode(curLine.value.episodes[0].ep);
+              playEpisode(curLine.value.episodes[0]);
             }
           } catch (e) {
             vError.value = e.message || String(e);
@@ -633,7 +642,7 @@
           vExternalUrl.value = "";
           destroyVideo();
           if (curLine.value && curLine.value.episodes.length) {
-            playEpisode(curLine.value.episodes[0].ep);
+            playEpisode(curLine.value.episodes[0]);
           }
         };
 
@@ -660,17 +669,38 @@
           }
         };
 
-        const playEpisode = async (ep) => {
+        const playEpisode = async (e) => {
           if (!vCurrent.value || !curLine.value) return;
+          const ep = typeof e === "object" ? e.ep : e;
           vEp.value = ep;
           vPlayMsg.value = "正在解析播放地址...";
           vExternalUrl.value = "";
-          vCurrentFrom.value = "";
+          vCurrentFrom.value = curLine.value.from || "";
           destroyVideo();
+          const src = vCurrent.value.source;
+          // 采集 API 来源：详情里已带播放地址，直接播
+          if (e && typeof e === "object" && e.url) {
+            if (e.url.includes(".m3u8")) {
+              await playM3u8(proxiedVideo(e.url, src));
+              vPlayMsg.value = "";
+            } else if (e.url.toLowerCase().endsWith(".mp4")) {
+              await nextTick();
+              if (videoRef.value) {
+                videoRef.value.src = proxiedVideo(e.url, src);
+                videoRef.value.play().catch(() => {});
+              }
+              vPlayMsg.value = "";
+            } else {
+              vExternalUrl.value = e.url;
+              vPlayMsg.value = "";
+            }
+            return;
+          }
+          // zg01：需要再解析播放页
           try {
             const q = new URLSearchParams({
               id: vCurrent.value.id,
-              source: vCurrent.value.source,
+              source: src,
               line: curLine.value.line,
               ep,
             });
@@ -679,12 +709,12 @@
             if (!res.ok) throw new Error(data.error || "解析失败");
             vCurrentFrom.value = data.from || "";
             if (data.isM3u8) {
-              await playM3u8(proxiedVideo(data.url));
+              await playM3u8(proxiedVideo(data.url, src));
               vPlayMsg.value = "";
             } else if (data.isMp4) {
               await nextTick();
               if (videoRef.value) {
-                videoRef.value.src = proxiedVideo(data.url);
+                videoRef.value.src = proxiedVideo(data.url, src);
                 videoRef.value.play().catch(() => {});
               }
               vPlayMsg.value = "";
@@ -692,8 +722,8 @@
               vExternalUrl.value = data.url || "";
               vPlayMsg.value = data.url ? "" : "未获取到播放地址。";
             }
-          } catch (e) {
-            vPlayMsg.value = e.message || String(e);
+          } catch (err) {
+            vPlayMsg.value = err.message || String(err);
           }
         };
 
@@ -707,7 +737,7 @@
           // video
           vKeyword, vItems, vBlocked, vLoading, vError, vCurrent, vDetail, vDetailLoading,
           vLineIdx, vEp, videoRef, vPlayMsg, vExternalUrl, vCurrentFrom, vPlaceholder,
-          curLine, vsearch, openVideo, selectLine, playEpisode,
+          curLine, vsearch, openVideo, selectLine, playEpisode, vSources, vSourceName,
         };
       },
     }).mount("#app");

@@ -1331,7 +1331,8 @@ def _xiunews_warm_session() -> Any:
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             try:
                 # 预热取 cookie；会话会被缓存复用，仅冷启动支付一次。
-                sess.get(XIUNEWS_BASE + "/", timeout=10)
+                # 短超时：站点可达时主页 <1s 即返回，被拦时不白等（失败也照常返回会话）。
+                sess.get(XIUNEWS_BASE + "/", timeout=5)
             except Exception:
                 pass
             _xiunews_session = sess
@@ -1488,7 +1489,9 @@ def search_xiunews(keyword: str) -> list[BookItem]:
 
 def detail_xiunews(bid: str) -> dict[str, Any]:
     page = f"{XIUNEWS_BASE}/{bid}/"
-    html = _xiunews_html(page)
+    # 详情页快速失败（retries=0）：站点被拦时尽快回退到友好提示，由用户手动重试，
+    # 而非每次重试都重新预热会话、把等待拖到 ~40s。
+    html = _xiunews_html(page, timeout=12, retries=0)
     soup = BeautifulSoup(html, "lxml")
     title = ""
     h1 = soup.find("h1")
@@ -1530,8 +1533,9 @@ def detail_xiunews(bid: str) -> dict[str, Any]:
 
 
 def _xiunews_chapter_text(bid: str, cid: str) -> tuple[str, list[str]]:
-    # 章节页用较短超时 + 一次重试（最多约 24s），避免站点拦截时长时间挂起。
-    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=1)
+    # 章节页快速失败（retries=0）：被拦时尽快回退到「重试本章 / 原站阅读」，
+    # 而非每次重试都重新预热会话、把等待拖到 ~40s。
+    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=0)
     soup = BeautifulSoup(html, "lxml")
     name = ""
     h1 = soup.find("h1")
@@ -1627,7 +1631,12 @@ def api_book_detail():
             return jsonify(detail_xiunews(bid))
         return jsonify({"error": f"暂不支持来源: {source}"}), 400
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        text = str(exc).lower()
+        if source == "xiunews" and ("timed out" in text or "curl: (28)" in text or "timeout" in text):
+            msg = "详情加载超时：笔趣阁偶发拦截服务器/本机 IP。可重试，或点下方按钮在原站查看目录。"
+            return jsonify({"error": msg, "pageUrl": f"{XIUNEWS_BASE}/{bid}/"}), 502
+        page_url = f"{XIUNEWS_BASE}/{bid}/" if source == "xiunews" else ""
+        return jsonify({"error": f"详情加载失败：{exc}", "pageUrl": page_url}), 500
 
 
 @app.get("/api/book/chapter")

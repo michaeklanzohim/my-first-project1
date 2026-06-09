@@ -597,6 +597,13 @@
             </div>
 
             <p v-if="bDetailLoading" class="hint">正在加载详情...</p>
+            <div v-else-if="bDetailError" class="reader-fallback">
+              <p class="error">{{ bDetailError }}</p>
+              <div class="reader-fallback-actions">
+                <button class="btn" @click="retryDetail">重试</button>
+                <a v-if="bDetailErrorUrl" class="btn" :href="bDetailErrorUrl" target="_blank" rel="noopener">打开原站页面 ↗</a>
+              </div>
+            </div>
             <p v-if="bDetail.desc" class="book-desc">{{ bDetail.desc }}</p>
 
             <div class="actions">
@@ -1053,6 +1060,8 @@
         const bCurrent = ref(null);
         const bDetail = ref({});
         const bDetailLoading = ref(false);
+        const bDetailError = ref("");
+        const bDetailErrorUrl = ref("");
         const bDownloading = ref(false);
         const bPlaceholder = "data:image/svg+xml," + encodeURIComponent(
           '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="180"><rect width="100%" height="100%" fill="#243156"/><text x="50%" y="52%" fill="#9fb0d9" font-size="16" text-anchor="middle">电子书</text></svg>'
@@ -1107,17 +1116,25 @@
           bDetail.value = { title: b.title, author: b.author, cover: b.cover, kind: b.kind };
           bDetailLoading.value = true;
           bError.value = "";
+          bDetailError.value = "";
+          bDetailErrorUrl.value = "";
           try {
             const res = await fetch(`/api/book/detail?source=${b.source}&id=${encodeURIComponent(b.id)}`);
             const data = await res.json();
-            if (!res.ok) throw new Error(data.error || "加载详情失败");
+            if (!res.ok) {
+              bDetailErrorUrl.value = data.pageUrl || b.url || "";
+              throw new Error(data.error || "加载详情失败");
+            }
             bDetail.value = data;
           } catch (e) {
-            bError.value = e.message || String(e);
+            bDetailError.value = e.message || String(e);
+            if (!bDetailErrorUrl.value) bDetailErrorUrl.value = b.url || "";
           } finally {
             bDetailLoading.value = false;
           }
         };
+
+        const retryDetail = () => { if (bCurrent.value) openBook(bCurrent.value); };
 
         const loadChapter = async (idx) => {
           const chapters = bDetail.value.chapters || [];
@@ -1201,7 +1218,7 @@
           curLine, vsearch, openVideo, selectLine, playEpisode, vSources, vSourceName,
           // ebook
           bKeyword, bItems, bReadItems, bDownloadItems, bBlocked, bLoading, bError,
-          bCurrent, bDetail, bDetailLoading, onBookCoverError,
+          bCurrent, bDetail, bDetailLoading, bDetailError, bDetailErrorUrl, retryDetail, onBookCoverError,
           bDownloading, bPlaceholder, bSourceName, bsearch, openBook, downloadBook,
           readerOpen, readerIdx, readerChapter, readerLoading, readerError, readerErrorUrl, readerListOpen,
           readerFont, readerBodyRef, openReader, closeReader, retryChapter,

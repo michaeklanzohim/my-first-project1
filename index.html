@@ -613,7 +613,7 @@
                 @click="openReader(0)"
               >开始在线阅读</button>
               <button
-                v-if="bDetail.kind === 'read' && (bDetail.chapters || []).length"
+                v-if="bDetail.kind === 'read' && bDetail.downloadable !== false && (bDetail.chapters || []).length"
                 class="btn"
                 :disabled="bDownloading"
                 @click="downloadBook"
@@ -628,6 +628,7 @@
               >{{ d.label }} ↗</a>
               <a v-if="bDetail.pageUrl" class="btn" :href="bDetail.pageUrl" target="_blank" rel="noopener">打开原站页面 ↗</a>
             </div>
+            <p v-if="bDetail.readNote" class="hint">{{ bDetail.readNote }}</p>
 
             <div v-if="bDetail.kind === 'read' && (bDetail.chapters || []).length" class="chapter-box">
               <div class="card-hd" style="padding:12px 0;">

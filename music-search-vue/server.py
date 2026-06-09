@@ -1330,8 +1330,8 @@ def _xiunews_warm_session() -> Any:
             sess = cffi_requests.Session(impersonate="chrome124")
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             try:
-                # 预热取 cookie；站点被拦时用短超时，避免冷启动白等。
-                sess.get(XIUNEWS_BASE + "/", timeout=6)
+                # 预热取 cookie；会话会被缓存复用，仅冷启动支付一次。
+                sess.get(XIUNEWS_BASE + "/", timeout=10)
             except Exception:
                 pass
             _xiunews_session = sess
@@ -1462,16 +1462,27 @@ def enrich_xiunews_covers(items: list[BookItem], deadline: float = 9.0) -> None:
         pool.shutdown(wait=False)
 
 
+# 单源在 /api/book/search 聚合里的整体预算（见 f.result(timeout=...)）。
+XIUNEWS_BUDGET = 20.0
+
+
 def search_xiunews(keyword: str) -> list[BookItem]:
     # 站点搜索为 GET，searchkey 用 UTF-8 编码（站点已迁移到 UTF-8；旧代码误用 GBK 导致结果恒空）。
-    # 搜索页快速失败（retries=0），站点被拦时不要拖慢整个聚合搜索；重试只用于章节阅读。
+    # 搜索页给足超时以保证能出结果；retries=0 避免重试把整次聚合搜索拖到 ~40s。
     url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword)}"
+    start = time.monotonic()
     try:
-        html, final_url = _xiunews_fetch(url, timeout=6, retries=0)
+        html, final_url = _xiunews_fetch(url, timeout=15, retries=0)
     except Exception:
         return []
     items = _parse_xiunews_results(html, final_url, keyword)
-    enrich_xiunews_covers(items, deadline=8.0)
+    # 封面补全只用「剩余预算」，绝不挤占出结果的时间：搜索慢时少补甚至不补，但结果照常返回。
+    remaining = XIUNEWS_BUDGET - (time.monotonic() - start)
+    if remaining >= 2.0:
+        try:
+            enrich_xiunews_covers(items, deadline=min(8.0, remaining))
+        except Exception:
+            pass  # 补封面失败绝不能影响搜索结果
     return items
 
 

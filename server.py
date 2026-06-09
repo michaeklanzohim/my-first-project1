@@ -1071,7 +1071,7 @@ BOOK_SOURCES = [
         "scrapable": True,
         "kind": "read",
         "search": XIUNEWS_BASE + "/modules/article/search.php?searchkey={kw}",
-        "search_charset": "gbk",
+        "search_charset": "utf-8",
         "note": "小说站，支持站内在线阅读 / 下载 TXT（部分 CDN 拦机房 IP，住宅宽带更稳）",
     },
     {
@@ -1146,7 +1146,7 @@ def http_get_bytes(url: str, headers: dict | None = None, referer: str | None = 
 def _book_search_url(site: dict[str, Any], keyword: str) -> str:
     tpl = site.get("search")
     if tpl:
-        # 个别站点的搜索参数需用特定编码（如笔趣阁 search.php 期望 GBK），否则原站也搜不到。
+        # 个别站点的搜索参数需用特定编码（由各源的 search_charset 指定，如笔趣阁现在认 UTF-8），否则原站也搜不到。
         charset = site.get("search_charset")
         kw = keyword.encode(charset, "ignore") if charset else keyword
         return tpl.replace("{kw}", urllib.parse.quote(kw))
@@ -1512,10 +1512,11 @@ def _xiunews_search_once(keyword: str, method: str, charset: str, timeout: int) 
     return _parse_xiunews_results(html, final_url, keyword)
 
 
-# 笔趣阁用的是 jieqi 引擎：搜索通常认 **POST + GBK** 表单；个别镜像/线路下 GET 或
-# UTF-8 才出结果。历史上每次只用一种方式，换一次就「又搜不到」，故这里按可靠性顺序
-# 依次尝试，取第一种能解析出结果的方式。
-XIUNEWS_STRATEGIES = [("POST", "gbk"), ("GET", "gbk"), ("GET", "utf-8")]
+# 笔趣阁用的是 jieqi 引擎，不同部署/线路对 method+charset 的要求不一样，历史上每次只用
+# 一种方式、换一次就「又搜不到」。故按可靠性顺序依次尝试，取第一种能解析出结果的方式。
+# 顺序很关键：把当前线上可用且秒回的 GET+UTF-8 放最前，避免靠前的策略（如会被防火墙丢弃、
+# 必定连接超时的 POST）白白吃光超时预算，导致真正能出结果的策略没机会跑（=结果消失的根因）。
+XIUNEWS_STRATEGIES = [("GET", "utf-8"), ("GET", "gbk"), ("POST", "gbk")]
 
 
 def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:

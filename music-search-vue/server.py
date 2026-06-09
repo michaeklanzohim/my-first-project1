@@ -1536,9 +1536,9 @@ def search_xiunews(keyword: str) -> list[BookItem]:
 
 def detail_xiunews(bid: str) -> dict[str, Any]:
     page = f"{XIUNEWS_BASE}/{bid}/"
-    # 详情页快速失败（retries=0）：站点被拦时尽快回退到友好提示，由用户手动重试，
-    # 而非每次重试都重新预热会话、把等待拖到 ~40s。
-    html = _xiunews_html(page, timeout=12, retries=0)
+    # 站点偶发拦机房/本机 IP，首次请求常超时；重试时会重置并重新预热会话（拿新 cookie），
+    # 这正是让详情能稳定加载的关键。仅在重试耗尽后才由路由回退到「原站查看目录」。
+    html = _xiunews_html(page, timeout=12, retries=2)
     soup = BeautifulSoup(html, "lxml")
     title = ""
     h1 = soup.find("h1")
@@ -1580,9 +1580,8 @@ def detail_xiunews(bid: str) -> dict[str, Any]:
 
 
 def _xiunews_chapter_text(bid: str, cid: str) -> tuple[str, list[str]]:
-    # 章节页快速失败（retries=0）：被拦时尽快回退到「重试本章 / 原站阅读」，
-    # 而非每次重试都重新预热会话、把等待拖到 ~40s。
-    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=0)
+    # 章节页允许一次重试（重置会话后再试），抓起偶发超时；仍耗尽才回退到「重试本章 / 原站阅读」。
+    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=1)
     soup = BeautifulSoup(html, "lxml")
     name = ""
     h1 = soup.find("h1")

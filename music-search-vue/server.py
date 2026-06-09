@@ -1071,6 +1071,7 @@ BOOK_SOURCES = [
         "scrapable": True,
         "kind": "read",
         "search": XIUNEWS_BASE + "/modules/article/search.php?searchkey={kw}",
+        "search_charset": "gbk",
         "note": "小说站，支持站内在线阅读 / 下载 TXT（部分 CDN 拦机房 IP，住宅宽带更稳）",
     },
     {
@@ -1137,7 +1138,10 @@ def http_get_bytes(url: str, headers: dict | None = None, referer: str | None = 
 def _book_search_url(site: dict[str, Any], keyword: str) -> str:
     tpl = site.get("search")
     if tpl:
-        return tpl.replace("{kw}", urllib.parse.quote(keyword))
+        # 个别站点的搜索参数需用特定编码（如笔趣阁 search.php 期望 GBK），否则原站也搜不到。
+        charset = site.get("search_charset")
+        kw = keyword.encode(charset, "ignore") if charset else keyword
+        return tpl.replace("{kw}", urllib.parse.quote(kw))
     return site["url"]
 
 
@@ -1355,8 +1359,11 @@ def _xiunews_decode(raw: bytes) -> str:
         return raw.decode("gbk", "ignore")
 
 
-def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2) -> tuple[str, str]:
+def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2,
+                   data: bytes | None = None, content_type: str | None = None) -> tuple[str, str]:
     """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。
+
+    data 非空时改用 POST（笔趣阁 jieqi 搜索引擎只认 POST 表单，GET 仅回空表头）。
 
     部分机房 / 住宅 IP 偶发连接超时（curl 28）；这里做有限次重试，失败后重置
     会话再试，最大限度降低「章节加载失败: Connection timed out」的概率。
@@ -1364,12 +1371,24 @@ def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2) -> tuple[str, 
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
+            headers = {"Referer": XIUNEWS_BASE + "/"}
+            if content_type:
+                headers["Content-Type"] = content_type
             sess = _xiunews_warm_session()
             if sess is not None:
-                resp = sess.get(url, headers={"Referer": XIUNEWS_BASE + "/"}, timeout=timeout)
+                if data is not None:
+                    resp = sess.post(url, data=data, headers=headers, timeout=timeout)
+                else:
+                    resp = sess.get(url, headers=headers, timeout=timeout)
                 resp.raise_for_status()
                 final = getattr(resp, "url", url) or url
                 return _xiunews_decode(resp.content), str(final)
+            if data is not None:
+                req = urllib.request.Request(url, data=data, method="POST",
+                                             headers={"User-Agent": UA, "Referer": XIUNEWS_BASE + "/",
+                                                      **({"Content-Type": content_type} if content_type else {})})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return _xiunews_decode(resp.read()), getattr(resp, "url", url) or url
             raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
             return _xiunews_decode(raw), url
         except Exception as exc:
@@ -1468,19 +1487,46 @@ def enrich_xiunews_covers(items: list[BookItem], deadline: float = 9.0) -> None:
 XIUNEWS_BUDGET = 20.0
 
 
+SEARCH_PHP = XIUNEWS_BASE + "/modules/article/search.php"
+
+
+def _xiunews_search_once(keyword: str, method: str, charset: str, timeout: int) -> list[BookItem]:
+    """按指定 method/charset 跑一次站内搜索并解析结果。"""
+    kw = keyword.encode(charset, "ignore")
+    if method == "POST":
+        body = ("searchkey=" + urllib.parse.quote(kw)).encode("ascii")
+        html, final_url = _xiunews_fetch(
+            SEARCH_PHP, timeout=timeout, retries=0, data=body,
+            content_type=f"application/x-www-form-urlencoded; charset={charset}")
+    else:
+        url = f"{SEARCH_PHP}?searchkey={urllib.parse.quote(kw)}"
+        html, final_url = _xiunews_fetch(url, timeout=timeout, retries=0)
+    return _parse_xiunews_results(html, final_url, keyword)
+
+
 def search_xiunews(keyword: str) -> list[BookItem]:
-    # 站点搜索为 GET，searchkey 用 UTF-8 编码（站点已迁移到 UTF-8；旧代码误用 GBK 导致结果恒空）。
-    # 搜索页给足超时以保证能出结果；retries=0 避免重试把整次聚合搜索拖到 ~40s。
-    url = f"{XIUNEWS_BASE}/modules/article/search.php?searchkey={urllib.parse.quote(keyword)}"
+    # 笔趣阁用的是 jieqi 引擎：搜索只认 **POST + GBK** 表单，GET 仅回「空表头」镜像页，
+    # 早前改 GET+UTF-8 正是「又搜索不到结果」的根因。这里按可靠性依次尝试多种组合，
+    # 取第一种能解析出结果的方式；并受整体预算约束，避免把聚合搜索拖到 ~40s。
     start = time.monotonic()
-    try:
-        html, final_url = _xiunews_fetch(url, timeout=15, retries=0)
-    except Exception:
-        return []
-    items = _parse_xiunews_results(html, final_url, keyword)
+    deadline = start + min(18.0, XIUNEWS_BUDGET)
+    strategies = [("POST", "gbk"), ("GET", "gbk"), ("GET", "utf-8")]
+
+    items: list[BookItem] = []
+    for method, charset in strategies:
+        left = deadline - time.monotonic()
+        if left <= 1.0:
+            break
+        try:
+            items = _xiunews_search_once(keyword, method, charset, timeout=int(min(10.0, left)))
+        except Exception:
+            items = []  # 该策略失败（超时/被拦/方法不被接受）：继续尝试下一种
+        if items:
+            break
+
     # 封面补全只用「剩余预算」，绝不挤占出结果的时间：搜索慢时少补甚至不补，但结果照常返回。
     remaining = XIUNEWS_BUDGET - (time.monotonic() - start)
-    if remaining >= 2.0:
+    if items and remaining >= 2.0:
         try:
             enrich_xiunews_covers(items, deadline=min(8.0, remaining))
         except Exception:

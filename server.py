@@ -1107,6 +1107,14 @@ BOOK_SOURCES = [
 BOOK_SOURCE_BY_KEY = {s["key"]: s for s in BOOK_SOURCES}
 
 
+class SourceUnavailable(Exception):
+    """某个可抓取来源此刻不可用（连接超时 / 拦截本机或服务器 IP）。
+
+    与「正常返回空结果」区分开：抛出本异常时，聚合层会把该来源降级为
+    「打开原站搜索」入口，而不是让它的结果悄悄消失。
+    """
+
+
 @dataclass
 class BookItem:
     source: str
@@ -1517,18 +1525,28 @@ def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:
     慢策略把预算吃光、让原本能出结果的回退策略根本没机会跑——这正是「结果又消失」的根因之一。
     """
     n = len(XIUNEWS_STRATEGIES)
+    attempts = 0
+    errors = 0
+    last_exc: Exception | None = None
     for idx, (method, charset) in enumerate(XIUNEWS_STRATEGIES):
         left = deadline - time.monotonic()
         if left <= 2.0:
             break
         per = min(8.0, max(3.0, left / (n - idx)))  # 在剩余预算里公平均分，且 3s≤每次≤8s
         per = min(per, left - 0.5)                   # 但绝不超出剩余预算
+        attempts += 1
         try:
             items = _xiunews_search_once(keyword, method, charset, timeout=int(per))
-        except Exception:
+        except Exception as exc:
+            errors += 1
+            last_exc = exc
             items = []  # 该策略失败（超时/被拦/方法不被接受）：继续尝试下一种
         if items:
             return items
+    # 每个尝试过的策略都因网络错误（连接超时 / 被拒）失败、且没拿到任何响应：判定该源此刻
+    # 不可用，上抛异常让聚合层给出「打开原站搜索」入口，而不是悄悄返回空（与「200 空结果」区分）。
+    if attempts > 0 and errors == attempts:
+        raise SourceUnavailable(str(last_exc) if last_exc else "xiunews unavailable")
     return []
 
 
@@ -1537,7 +1555,13 @@ def search_xiunews(keyword: str) -> list[BookItem]:
     deadline = start + min(18.0, XIUNEWS_BUDGET)
     # 先预热一次（已缓存则无开销），免得预热的数秒开销算进第一个策略、把它挤超时。
     _xiunews_warm_session()
-    items = _xiunews_search_round(keyword, deadline)
+    try:
+        items = _xiunews_search_round(keyword, deadline)
+    except SourceUnavailable:
+        # 站点拦截了本机 / 服务器 IP（连接超时）：重置会话以便下次重新预热，并上抛异常，
+        # 让聚合层把笔趣阁降级为「打开原站搜索」入口（而不是悄悄返回空）。
+        _xiunews_reset_session()
+        raise
     if not items:
         # 一轮全空多半是会话 cookie 失效被「200 空结果」软拦——重置会话，下次搜索会重新
         # 预热拿新 cookie，避免「结果永久消失直到重启」。
@@ -1644,6 +1668,7 @@ def api_book_search():
         "xiunews": (lambda: search_xiunews(q)),
     }
     results: dict[str, list[BookItem]] = {}
+    failed: set[str] = set()  # 因拦截 / 超时而抓取失败的可抓取来源
     with ThreadPoolExecutor(max_workers=len(scrapers)) as pool:
         futs = {k: pool.submit(fn) for k, fn in scrapers.items()}
         for k, f in futs.items():
@@ -1651,6 +1676,7 @@ def api_book_search():
                 results[k] = f.result(timeout=22)
             except Exception:
                 results[k] = []
+                failed.add(k)
 
     # 过滤掉标题与关键词无关的结果（部分源会返回热门/无关书目）
     for k in results:
@@ -1674,6 +1700,14 @@ def api_book_search():
         {"key": s["key"], "name": s["name"], "url": _book_search_url(s, q), "note": s.get("note", "")}
         for s in BOOK_SOURCES
         if not s["scrapable"]
+    ]
+    # 可抓取来源若因拦截 / 超时而失败（如笔趣阁拦机房/本机 IP），降级为「打开原站搜索」入口，
+    # 避免它的结果悄悄消失、用户以为「搜不到」。
+    blocked += [
+        {"key": s["key"], "name": s["name"], "url": _book_search_url(s, q),
+         "note": "服务端抓取超时（可能拦截了本机 / 服务器 IP），点此打开原站搜索"}
+        for s in BOOK_SOURCES
+        if s["scrapable"] and s["key"] in failed
     ]
     sources = [{"key": s["key"], "name": s["name"], "kind": s.get("kind", "")} for s in BOOK_SOURCES if s["scrapable"]]
     return jsonify(

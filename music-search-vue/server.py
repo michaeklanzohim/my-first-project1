@@ -1331,8 +1331,9 @@ def _xiunews_warm_session() -> Any:
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
             try:
                 # 预热取 cookie；会话会被缓存复用，仅冷启动支付一次。
-                # 短超时：站点可达时主页 <1s 即返回，被拦时不白等（失败也照常返回会话）。
-                sess.get(XIUNEWS_BASE + "/", timeout=5)
+                # 超时需给足：跨区到笔趣阁主页常需数秒，预热拿到 cookie 才能让搜索不被拦成空结果。
+                # （5s 过短会导致部分网络下搜索结果消失，10s 为 PR #12 验证可用的值。）
+                sess.get(XIUNEWS_BASE + "/", timeout=10)
             except Exception:
                 pass
             _xiunews_session = sess

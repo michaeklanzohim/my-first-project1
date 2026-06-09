@@ -1504,25 +1504,44 @@ def _xiunews_search_once(keyword: str, method: str, charset: str, timeout: int) 
     return _parse_xiunews_results(html, final_url, keyword)
 
 
-def search_xiunews(keyword: str) -> list[BookItem]:
-    # 笔趣阁用的是 jieqi 引擎：搜索只认 **POST + GBK** 表单，GET 仅回「空表头」镜像页，
-    # 早前改 GET+UTF-8 正是「又搜索不到结果」的根因。这里按可靠性依次尝试多种组合，
-    # 取第一种能解析出结果的方式；并受整体预算约束，避免把聚合搜索拖到 ~40s。
-    start = time.monotonic()
-    deadline = start + min(18.0, XIUNEWS_BUDGET)
-    strategies = [("POST", "gbk"), ("GET", "gbk"), ("GET", "utf-8")]
+# 笔趣阁用的是 jieqi 引擎：搜索通常认 **POST + GBK** 表单；个别镜像/线路下 GET 或
+# UTF-8 才出结果。历史上每次只用一种方式，换一次就「又搜不到」，故这里按可靠性顺序
+# 依次尝试，取第一种能解析出结果的方式。
+XIUNEWS_STRATEGIES = [("POST", "gbk"), ("GET", "gbk"), ("GET", "utf-8")]
 
-    items: list[BookItem] = []
-    for method, charset in strategies:
+
+def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:
+    """按 POST(GBK)→GET(GBK)→GET(UTF-8) 跑一轮，命中即返回。
+
+    关键：给每个策略**公平的超时切片**（按剩余预算在尚未尝试的策略间均分），避免靠前的
+    慢策略把预算吃光、让原本能出结果的回退策略根本没机会跑——这正是「结果又消失」的根因之一。
+    """
+    n = len(XIUNEWS_STRATEGIES)
+    for idx, (method, charset) in enumerate(XIUNEWS_STRATEGIES):
         left = deadline - time.monotonic()
-        if left <= 1.0:
+        if left <= 2.0:
             break
+        per = min(8.0, max(3.0, left / (n - idx)))  # 在剩余预算里公平均分，且 3s≤每次≤8s
+        per = min(per, left - 0.5)                   # 但绝不超出剩余预算
         try:
-            items = _xiunews_search_once(keyword, method, charset, timeout=int(min(10.0, left)))
+            items = _xiunews_search_once(keyword, method, charset, timeout=int(per))
         except Exception:
             items = []  # 该策略失败（超时/被拦/方法不被接受）：继续尝试下一种
         if items:
-            break
+            return items
+    return []
+
+
+def search_xiunews(keyword: str) -> list[BookItem]:
+    start = time.monotonic()
+    deadline = start + min(18.0, XIUNEWS_BUDGET)
+    # 先预热一次（已缓存则无开销），免得预热的数秒开销算进第一个策略、把它挤超时。
+    _xiunews_warm_session()
+    items = _xiunews_search_round(keyword, deadline)
+    if not items:
+        # 一轮全空多半是会话 cookie 失效被「200 空结果」软拦——重置会话，下次搜索会重新
+        # 预热拿新 cookie，避免「结果永久消失直到重启」。
+        _xiunews_reset_session()
 
     # 封面补全只用「剩余预算」，绝不挤占出结果的时间：搜索慢时少补甚至不补，但结果照常返回。
     remaining = XIUNEWS_BUDGET - (time.monotonic() - start)
@@ -1754,6 +1773,46 @@ def api_book_download():
         "Content-Disposition": f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}",
     }
     return Response(generate(), headers=headers)
+
+
+@app.get("/api/book/xiunews_diag")
+def api_book_xiunews_diag():
+    """临时诊断：在「你的网络」上把每种 method×charset 各跑一次站内搜索，
+    返回每种方式的耗时/解析行数/书页链接数/示例书目，用于定位「搜索结果消失」。
+    用法：浏览器打开 /api/book/xiunews_diag?kw=斗破苍穹 ，把返回的 JSON 贴给开发者。
+    """
+    kw = (request.args.get("kw") or "斗破苍穹").strip()
+    # 与真实搜索一致：先预热带 cookie 的会话
+    _xiunews_warm_session()
+    results: list[dict[str, Any]] = []
+    for method in ("POST", "GET"):
+        for charset in ("gbk", "utf-8"):
+            rec: dict[str, Any] = {"method": method, "charset": charset}
+            t0 = time.monotonic()
+            try:
+                kwb = kw.encode(charset, "ignore")
+                if method == "POST":
+                    body = ("searchkey=" + urllib.parse.quote(kwb)).encode("ascii")
+                    html, final_url = _xiunews_fetch(
+                        SEARCH_PHP, timeout=12, retries=0, data=body,
+                        content_type=f"application/x-www-form-urlencoded; charset={charset}")
+                else:
+                    url = f"{SEARCH_PHP}?searchkey={urllib.parse.quote(kwb)}"
+                    html, final_url = _xiunews_fetch(url, timeout=12, retries=0)
+                items = _parse_xiunews_results(html, final_url, kw)
+                rec.update({
+                    "ok": True,
+                    "rows": len(items),
+                    "final_url": final_url,
+                    "html_len": len(html),
+                    "book_links": len(re.findall(r"/\d+_\d+/", html)),
+                    "sample": [{"id": it.id, "title": it.title, "author": it.author} for it in items[:5]],
+                })
+            except Exception as exc:
+                rec.update({"ok": False, "error": str(exc)})
+            rec["ms"] = int((time.monotonic() - t0) * 1000)
+            results.append(rec)
+    return jsonify({"kw": kw, "has_cffi": HAS_CFFI, "search_php": SEARCH_PHP, "results": results})
 
 
 if __name__ == "__main__":

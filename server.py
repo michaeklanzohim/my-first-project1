@@ -1387,27 +1387,21 @@ def _xiunews_get(url: str, referer: str, timeout: int = 12, retries: int = 1,
 XIUNEWS_SEARCH_API = XIUNEWS_SEARCH_BASE + "/user/search.html"
 
 
-def search_xiunews(keyword: str) -> list[BookItem]:
-    """走移动站 JSON 搜索接口；失败 / 被反爬挡住时抛 SourceUnavailable，让聚合层给出原站入口。"""
-    q = urllib.parse.quote(keyword)
-    referer = f"{XIUNEWS_SEARCH_BASE}/s?q={q}"
-    try:
-        text, _ = _xiunews_get(
-            f"{XIUNEWS_SEARCH_API}?q={q}", referer=referer, timeout=12, retries=1,
-            headers={"X-Requested-With": "XMLHttpRequest",
-                     "Accept": "application/json, text/javascript, */*; q=0.01"})
-    except Exception as exc:
-        raise SourceUnavailable(str(exc))
-    text = text.strip()
-    # 接口被反爬挡住时返回字面量 "1"（非 JSON）：视为暂不可用，交由聚合层降级为原站入口。
+# 搜索按顺序尝试的站点（移动站接口返回 JSON；桌面站接口常被反爬，留作兜底）。
+XIUNEWS_SEARCH_HOSTS = [XIUNEWS_SEARCH_BASE, XIUNEWS_BASE]
+
+
+def _xiunews_parse_search_json(text: str) -> tuple[list[BookItem], int]:
+    """解析搜索接口 JSON，返回 (书目, 原始列表长度)。被反爬挡住(非列表/字面量 1)返回 (-) 用 -1 标记。"""
+    text = (text or "").strip()
     if not text or text == "1":
-        raise SourceUnavailable("search endpoint blocked")
+        return [], -1
     try:
         data = json.loads(text)
-    except Exception as exc:
-        raise SourceUnavailable(f"bad search json: {exc}")
+    except Exception:
+        return [], -1
     if not isinstance(data, list):
-        return []
+        return [], -1
     items: list[BookItem] = []
     seen: set[str] = set()
     for d in data:
@@ -1433,7 +1427,50 @@ def search_xiunews(keyword: str) -> list[BookItem]:
         )
         if len(items) >= 30:
             break
-    return items
+    return items, len(data)
+
+
+def _xiunews_search_attempt(host: str, keyword: str, warm: bool, timeout: int = 12) -> tuple[str, str]:
+    """对某站点跑一次搜索，返回 (raw_text, final_url)。warm=先访问 /s 与 /user/hm.html 模拟浏览器。"""
+    q = urllib.parse.quote(keyword)
+    base_ref = f"{host}/s?q={q}"
+    xhr = {"X-Requested-With": "XMLHttpRequest",
+           "Accept": "application/json, text/javascript, */*; q=0.01"}
+    sess = _xiunews_session_get()
+    if sess is not None:
+        if warm:
+            try:
+                sess.get(f"{host}/", timeout=timeout)
+                sess.get(base_ref, timeout=timeout, headers={"Referer": host + "/"})
+                sess.get(f"{host}/user/hm.html?q={q}", timeout=timeout,
+                         headers={"Referer": base_ref, **xhr})
+            except Exception:
+                pass
+        resp = sess.get(f"{host}/user/search.html?q={q}", timeout=timeout,
+                        headers={"Referer": base_ref, **xhr})
+        resp.raise_for_status()
+        return resp.text, str(getattr(resp, "url", "") or "")
+    raw = http_get_bytes(f"{host}/user/search.html?q={q}", referer=base_ref, headers=xhr, timeout=timeout)
+    return raw.decode("utf-8", "ignore"), ""
+
+
+def search_xiunews(keyword: str) -> list[BookItem]:
+    """多策略搜索：移动站直连 → 移动站模拟浏览器 → 桌面站。全部为空/被挡则抛 SourceUnavailable，
+    由聚合层降级为「打开原站搜索」入口（浏览器里可正常用）。"""
+    last_err = "no result"
+    for host in XIUNEWS_SEARCH_HOSTS:
+        for warm in (False, True):
+            try:
+                text, _ = _xiunews_search_attempt(host, keyword, warm=warm)
+            except Exception as exc:
+                last_err = str(exc)
+                _xiunews_reset_session()
+                continue
+            items, n = _xiunews_parse_search_json(text)
+            if items:
+                return items
+            last_err = f"empty (host={host} warm={warm} raw_len={len(text)} list_len={n})"
+    raise SourceUnavailable(last_err)
 
 
 def detail_xiunews(bid: str) -> dict[str, Any]:
@@ -1652,34 +1689,38 @@ def api_book_xiunews_diag():
     """
     kw = (request.args.get("kw") or "斗破苍穹").strip()
     out: dict[str, Any] = {
-        "kw": kw, "has_cffi": HAS_CFFI,
-        "search_api": XIUNEWS_SEARCH_API, "book_base": XIUNEWS_BASE,
+        "kw": kw, "has_cffi": HAS_CFFI, "book_base": XIUNEWS_BASE,
+        "hosts": XIUNEWS_SEARCH_HOSTS, "attempts": [],
     }
-    # 1) 搜索接口
-    t0 = time.monotonic()
+    # 1) 逐个站点 × 直连/模拟浏览器 各跑一次搜索，dump 原始返回，定位「你的网络拿到的到底是什么」
+    for host in XIUNEWS_SEARCH_HOSTS:
+        for warm in (False, True):
+            rec: dict[str, Any] = {"host": host, "warm": warm}
+            t0 = time.monotonic()
+            try:
+                _xiunews_reset_session()
+                text, final = _xiunews_search_attempt(host, kw, warm=warm)
+                items, n = _xiunews_parse_search_json(text)
+                rec.update({
+                    "ok": True, "ms": int((time.monotonic() - t0) * 1000),
+                    "final_url": final, "http_len": len(text), "raw_head": text[:200],
+                    "json_list_len": n, "books": len(items),
+                    "sample": [{"id": it.id, "title": it.title} for it in items[:3]],
+                })
+            except Exception as exc:
+                rec.update({"ok": False, "ms": int((time.monotonic() - t0) * 1000), "error": str(exc)})
+            out["attempts"].append(rec)
+    # 2) 书页 / 目录可达性（用已知书号 12189《斗破苍穹》）
+    t1 = time.monotonic()
     try:
-        items = search_xiunews(kw)
-        out["search"] = {
-            "ok": True, "ms": int((time.monotonic() - t0) * 1000), "rows": len(items),
-            "sample": [{"id": it.id, "title": it.title, "author": it.author} for it in items[:5]],
+        d = detail_xiunews("12189")
+        out["detail_12189"] = {
+            "ok": True, "ms": int((time.monotonic() - t1) * 1000),
+            "title": d.get("title"), "author": d.get("author"),
+            "chapters": len(d.get("chapters", [])), "has_cover": bool(d.get("cover")),
         }
     except Exception as exc:
-        out["search"] = {"ok": False, "ms": int((time.monotonic() - t0) * 1000), "error": str(exc)}
-    # 2) 书页 / 目录抓取（用搜索到的第一本，否则用一个已知书号）
-    bid = None
-    if out["search"].get("ok") and out["search"].get("sample"):
-        bid = out["search"]["sample"][0]["id"]
-    if bid:
-        t1 = time.monotonic()
-        try:
-            d = detail_xiunews(bid)
-            out["detail"] = {
-                "ok": True, "ms": int((time.monotonic() - t1) * 1000), "id": bid,
-                "title": d.get("title"), "author": d.get("author"),
-                "chapters": len(d.get("chapters", [])), "has_cover": bool(d.get("cover")),
-            }
-        except Exception as exc:
-            out["detail"] = {"ok": False, "ms": int((time.monotonic() - t1) * 1000), "error": str(exc)}
+        out["detail_12189"] = {"ok": False, "ms": int((time.monotonic() - t1) * 1000), "error": str(exc)}
     return jsonify(out)
 
 

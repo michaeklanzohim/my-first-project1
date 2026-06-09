@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import base64
+import http.cookiejar
 import json
 import re
+import socket
 import threading
 import time
 import urllib.parse
@@ -1320,80 +1322,75 @@ def detail_xiaolipan(pid: str) -> dict[str, Any]:
 
 # ---------------- 笔趣阁 xiunews（UTF-8，支持在线阅读 / 下载 TXT） ----------------
 
-_xiunews_session: Any = None
+# 笔趣阁用**普通 urllib** 抓取，不走 curl_cffi。
+# 实测：curl_cffi（chrome 指纹模拟）连本站会稳定 `curl (28) Connection timed out`，
+# 用户住宅网络与机房 VM 均复现；而普通 HTTP 请求是通的。本站是纯 http 站，不需要
+# TLS 指纹模拟。用一个带 cookiejar 的 opener 复用 cookie（替代原来的「预热会话」）。
+_xiunews_cookiejar = http.cookiejar.CookieJar()
+_xiunews_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_xiunews_cookiejar))
+_xiunews_warmed = False
 _xiunews_lock = threading.Lock()
 
 
-def _xiunews_warm_session() -> Any:
-    """返回一个已访问过首页、带 cookie 的 curl_cffi 会话；不可用时返回 None。"""
-    global _xiunews_session
-    if not HAS_CFFI:
-        return None
+def _xiunews_warm_session(timeout: int = 6) -> None:
+    """尽力访问一次首页拿 cookie（best-effort）。失败不致命，且只付一次；
+    用独立的短超时，绝不占用后续搜索的预算。"""
+    global _xiunews_warmed
     with _xiunews_lock:
-        if _xiunews_session is None:
-            sess = cffi_requests.Session(impersonate="chrome124")
-            sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
-            try:
-                # 预热取 cookie；会话会被缓存复用，仅冷启动支付一次。
-                # 超时需给足：跨区到笔趣阁主页常需数秒，预热拿到 cookie 才能让搜索不被拦成空结果。
-                # （5s 过短会导致部分网络下搜索结果消失，10s 为 PR #12 验证可用的值。）
-                sess.get(XIUNEWS_BASE + "/", timeout=10)
-            except Exception:
-                pass
-            _xiunews_session = sess
-        return _xiunews_session
+        if _xiunews_warmed:
+            return
+        try:
+            req = urllib.request.Request(
+                XIUNEWS_BASE + "/",
+                headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+            _xiunews_opener.open(req, timeout=timeout).read()
+        except Exception:
+            pass  # 拿不到 cookie 也无妨：search.php 多数情况下不强制要求
+        _xiunews_warmed = True  # 失败也标记，避免每次搜索都重复付这笔超时
 
 
 def _xiunews_reset_session() -> None:
-    """丢弃当前会话，下次取用时会重新预热（用于连接超时/被拦后的重试）。"""
-    global _xiunews_session
+    """清空 cookie 并允许下次重新预热（用于连接超时/被拦后的重试）。"""
+    global _xiunews_warmed
     with _xiunews_lock:
-        _xiunews_session = None
+        _xiunews_cookiejar.clear()
+        _xiunews_warmed = False
 
 
 def _xiunews_decode(raw: bytes) -> str:
-    """站点页面为 UTF-8；个别旧页可能是 GBK，做自适应解码。"""
+    """站点页面为 GBK；个别页可能是 UTF-8，做自适应解码。"""
     try:
-        return raw.decode("utf-8")
+        return raw.decode("gbk")
     except UnicodeDecodeError:
-        return raw.decode("gbk", "ignore")
+        return raw.decode("utf-8", "ignore")
 
 
 def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2,
                    data: bytes | None = None, content_type: str | None = None) -> tuple[str, str]:
-    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。
+    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。用普通 urllib + cookiejar。
 
-    data 非空时改用 POST（笔趣阁 jieqi 搜索引擎只认 POST 表单，GET 仅回空表头）。
+    data 非空时改用 POST（笔趣阁 jieqi 搜索引擎通常认 POST 表单）。
 
-    部分机房 / 住宅 IP 偶发连接超时（curl 28）；这里做有限次重试，失败后重置
-    会话再试，最大限度降低「章节加载失败: Connection timed out」的概率。
+    偶发连接超时（curl/urllib timed out）时做有限次重试，失败后清 cookie 再试，
+    最大限度降低「章节加载失败: Connection timed out」的概率。
     """
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            headers = {"Referer": XIUNEWS_BASE + "/"}
+            headers = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9",
+                       "Referer": XIUNEWS_BASE + "/"}
             if content_type:
                 headers["Content-Type"] = content_type
-            sess = _xiunews_warm_session()
-            if sess is not None:
-                if data is not None:
-                    resp = sess.post(url, data=data, headers=headers, timeout=timeout)
-                else:
-                    resp = sess.get(url, headers=headers, timeout=timeout)
-                resp.raise_for_status()
-                final = getattr(resp, "url", url) or url
-                return _xiunews_decode(resp.content), str(final)
-            if data is not None:
-                req = urllib.request.Request(url, data=data, method="POST",
-                                             headers={"User-Agent": UA, "Referer": XIUNEWS_BASE + "/",
-                                                      **({"Content-Type": content_type} if content_type else {})})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return _xiunews_decode(resp.read()), getattr(resp, "url", url) or url
-            raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
-            return _xiunews_decode(raw), url
+            req = urllib.request.Request(
+                url, data=data, headers=headers,
+                method="POST" if data is not None else "GET")
+            with _xiunews_opener.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+                final = resp.geturl() or url
+            return _xiunews_decode(raw), final
         except Exception as exc:
             last_exc = exc
-            # 超时 / 连接失败多半是会话或线路问题，重置会话后再试一次。
+            # 超时 / 连接失败多半是线路问题，清 cookie 重新预热后再试一次。
             _xiunews_reset_session()
             if attempt < retries:
                 time.sleep(0.6)
@@ -1521,10 +1518,18 @@ def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:
         left = deadline - time.monotonic()
         if left <= 2.0:
             break
-        per = min(8.0, max(3.0, left / (n - idx)))  # 在剩余预算里公平均分，且 3s≤每次≤8s
-        per = min(per, left - 0.5)                   # 但绝不超出剩余预算
+        # 在剩余预算里按「尚未尝试的策略数」公平均分，再夹到 [3s, 8s]，最后绝不超出剩余预算。
+        per = min(8.0, max(3.0, left / (n - idx)))
+        per = min(per, left - 0.5)
+        timeout = int(round(per))
+        if timeout < 2:
+            # 预算已不够给一个像样的切片：剩多少用多少（>=2s），仍给最后的策略一次机会，
+            # 绝不把负数/0 传给底层（旧 bug：负超时让真正能用的策略直接报错）。
+            timeout = max(2, int(left - 0.2))
+        if timeout < 2:
+            break
         try:
-            items = _xiunews_search_once(keyword, method, charset, timeout=int(per))
+            items = _xiunews_search_once(keyword, method, charset, timeout=timeout)
         except Exception:
             items = []  # 该策略失败（超时/被拦/方法不被接受）：继续尝试下一种
         if items:
@@ -1533,10 +1538,11 @@ def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:
 
 
 def search_xiunews(keyword: str) -> list[BookItem]:
+    # 预热放在计时**之前**：它有自己的短超时，绝不能占用搜索预算（旧逻辑里预热超时
+    # 吃掉 10s，导致后面策略拿到负数超时而全灭）。
+    _xiunews_warm_session()
     start = time.monotonic()
     deadline = start + min(18.0, XIUNEWS_BUDGET)
-    # 先预热一次（已缓存则无开销），免得预热的数秒开销算进第一个策略、把它挤超时。
-    _xiunews_warm_session()
     items = _xiunews_search_round(keyword, deadline)
     if not items:
         # 一轮全空多半是会话 cookie 失效被「200 空结果」软拦——重置会话，下次搜索会重新
@@ -1782,7 +1788,31 @@ def api_book_xiunews_diag():
     用法：浏览器打开 /api/book/xiunews_diag?kw=斗破苍穹 ，把返回的 JSON 贴给开发者。
     """
     kw = (request.args.get("kw") or "斗破苍穹").strip()
-    # 与真实搜索一致：先预热带 cookie 的会话
+    host = urllib.parse.urlparse(XIUNEWS_BASE).hostname or "www.xiunews.com"
+
+    # 1) 原始 TCP 连通性：能不能连上 host:80（区分「网络根本到不了」vs「到得了但搜不到」）。
+    tcp: dict[str, Any] = {"host": host, "port": 80}
+    t0 = time.monotonic()
+    try:
+        s = socket.create_connection((host, 80), timeout=8)
+        s.close()
+        tcp.update({"ok": True})
+    except Exception as exc:
+        tcp.update({"ok": False, "error": str(exc)})
+    tcp["ms"] = int((time.monotonic() - t0) * 1000)
+
+    # 2) 普通 urllib GET 首页（不带 curl_cffi）：验证纯 HTTP 是否可达。
+    home: dict[str, Any] = {"transport": "urllib"}
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(XIUNEWS_BASE + "/", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            home.update({"ok": True, "status": resp.status, "bytes": len(resp.read())})
+    except Exception as exc:
+        home.update({"ok": False, "error": str(exc)})
+    home["ms"] = int((time.monotonic() - t0) * 1000)
+
+    # 3) 实际搜索路径（已切换为 urllib + cookiejar）：每种 method×charset 各跑一次。
     _xiunews_warm_session()
     results: list[dict[str, Any]] = []
     for method in ("POST", "GET"):
@@ -1794,11 +1824,11 @@ def api_book_xiunews_diag():
                 if method == "POST":
                     body = ("searchkey=" + urllib.parse.quote(kwb)).encode("ascii")
                     html, final_url = _xiunews_fetch(
-                        SEARCH_PHP, timeout=12, retries=0, data=body,
+                        SEARCH_PHP, timeout=10, retries=0, data=body,
                         content_type=f"application/x-www-form-urlencoded; charset={charset}")
                 else:
                     url = f"{SEARCH_PHP}?searchkey={urllib.parse.quote(kwb)}"
-                    html, final_url = _xiunews_fetch(url, timeout=12, retries=0)
+                    html, final_url = _xiunews_fetch(url, timeout=10, retries=0)
                 items = _parse_xiunews_results(html, final_url, kw)
                 rec.update({
                     "ok": True,
@@ -1812,7 +1842,9 @@ def api_book_xiunews_diag():
                 rec.update({"ok": False, "error": str(exc)})
             rec["ms"] = int((time.monotonic() - t0) * 1000)
             results.append(rec)
-    return jsonify({"kw": kw, "has_cffi": HAS_CFFI, "search_php": SEARCH_PHP, "results": results})
+    return jsonify({"kw": kw, "has_cffi": HAS_CFFI, "transport": "urllib",
+                    "search_php": SEARCH_PHP, "tcp_connect": tcp,
+                    "plain_home_get": home, "results": results})
 
 
 if __name__ == "__main__":

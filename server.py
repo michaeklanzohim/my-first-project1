@@ -1041,7 +1041,8 @@ def api_video_stream():
 
 ANNAS_BASE = "https://zh.annas-archive.gl"
 XIAOLIPAN_BASE = "https://www.xiaolipan.com"
-XIUNEWS_BASE = "http://www.xiunews.com"
+XIUNEWS_BASE = "https://www.3bqg.cc"          # 新笔趣阁：书页 / 目录 / 章节页
+XIUNEWS_SEARCH_BASE = "https://m.3bqg.cc"     # 搜索走移动站 JSON 接口（PC 站会被反爬）
 
 # 可服务端抓取（search/detail）的来源 + 仅提供「打开原站」入口的来源。
 # scrapable=True 走聚合搜索；kind=read 支持站内在线阅读，kind=download 仅提供下载/原站。
@@ -1066,13 +1067,13 @@ BOOK_SOURCES = [
     },
     {
         "key": "xiunews",
-        "name": "笔趣阁 xiunews",
+        "name": "笔趣阁 3bqg",
         "url": XIUNEWS_BASE + "/",
         "scrapable": True,
         "kind": "read",
-        "search": XIUNEWS_BASE + "/modules/article/search.php?searchkey={kw}",
+        "search": XIUNEWS_BASE + "/s?q={kw}",
         "search_charset": "utf-8",
-        "note": "小说站，支持站内在线阅读 / 下载 TXT（部分 CDN 拦机房 IP，住宅宽带更稳）",
+        "note": "小说站，可搜索 + 看目录；章节正文有反爬，点击跳原站阅读",
     },
     {
         "key": "dushupai",
@@ -1326,14 +1327,21 @@ def detail_xiaolipan(pid: str) -> dict[str, Any]:
     }
 
 
-# ---------------- 笔趣阁 xiunews（UTF-8，支持在线阅读 / 下载 TXT） ----------------
+# ---------------- 笔趣阁（新笔趣阁 3bqg：搜索 + 目录；正文有反爬，跳原站阅读） ----------------
+#
+# 原 xiunews.com 已整站下线（域名仍解析到 23.224.68.102 但服务器无响应、连接超时），
+# 故改用仍在线的「新笔趣阁 3bqg」。各部分能力与限制：
+#   - 搜索：移动站 m.3bqg.cc 的 JSON 接口 /user/search.html?q=（PC 站同接口会被反爬挡成 "1"）。
+#   - 目录/详情：www.3bqg.cc/book/{书号}/ 可直接抓（封面 og:image、简介、.listmain 章节列表）。
+#   - 章节正文：站点对正文页加了 JS 跳转验证（在 33bqg.com / bqg205.xyz 等域名间跳转），
+#     服务端无法稳定抓取，故在线阅读/下载降级为「打开原站阅读」（真实浏览器可自动通过验证）。
 
 _xiunews_session: Any = None
 _xiunews_lock = threading.Lock()
 
 
-def _xiunews_warm_session() -> Any:
-    """返回一个已访问过首页、带 cookie 的 curl_cffi 会话；不可用时返回 None。"""
+def _xiunews_session_get() -> Any:
+    """返回一个可复用的 curl_cffi 会话（无 cffi 时返回 None，回退到 http_get_bytes）。"""
     global _xiunews_session
     if not HAS_CFFI:
         return None
@@ -1341,275 +1349,121 @@ def _xiunews_warm_session() -> Any:
         if _xiunews_session is None:
             sess = cffi_requests.Session(impersonate="chrome124")
             sess.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
-            try:
-                # 预热取 cookie；会话会被缓存复用，仅冷启动支付一次。
-                # 超时需给足：跨区到笔趣阁主页常需数秒，预热拿到 cookie 才能让搜索不被拦成空结果。
-                # （5s 过短会导致部分网络下搜索结果消失，10s 为 PR #12 验证可用的值。）
-                sess.get(XIUNEWS_BASE + "/", timeout=10)
-            except Exception:
-                pass
             _xiunews_session = sess
         return _xiunews_session
 
 
 def _xiunews_reset_session() -> None:
-    """丢弃当前会话，下次取用时会重新预热（用于连接超时/被拦后的重试）。"""
+    """丢弃当前会话，下次取用时重建（用于连接超时 / 被拦后的重试）。"""
     global _xiunews_session
     with _xiunews_lock:
         _xiunews_session = None
 
 
-def _xiunews_decode(raw: bytes) -> str:
-    """站点页面为 UTF-8；个别旧页可能是 GBK，做自适应解码。"""
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("gbk", "ignore")
-
-
-def _xiunews_fetch(url: str, timeout: int = 15, retries: int = 2,
-                   data: bytes | None = None, content_type: str | None = None) -> tuple[str, str]:
-    """抓取笔趣阁页面，返回 (解码后的 html, 最终 url)。优先用带 cookie 的会话。
-
-    data 非空时改用 POST（笔趣阁 jieqi 搜索引擎只认 POST 表单，GET 仅回空表头）。
-
-    部分机房 / 住宅 IP 偶发连接超时（curl 28）；这里做有限次重试，失败后重置
-    会话再试，最大限度降低「章节加载失败: Connection timed out」的概率。
-    """
+def _xiunews_get(url: str, referer: str, timeout: int = 12, retries: int = 1,
+                 headers: dict[str, str] | None = None) -> tuple[str, str]:
+    """GET 一个 3bqg 页面，返回 (html, final_url)；失败时重置会话并有限重试。"""
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            headers = {"Referer": XIUNEWS_BASE + "/"}
-            if content_type:
-                headers["Content-Type"] = content_type
-            sess = _xiunews_warm_session()
+            hdrs = {"Referer": referer}
+            if headers:
+                hdrs.update(headers)
+            sess = _xiunews_session_get()
             if sess is not None:
-                if data is not None:
-                    resp = sess.post(url, data=data, headers=headers, timeout=timeout)
-                else:
-                    resp = sess.get(url, headers=headers, timeout=timeout)
+                resp = sess.get(url, headers=hdrs, timeout=timeout)
                 resp.raise_for_status()
-                final = getattr(resp, "url", url) or url
-                return _xiunews_decode(resp.content), str(final)
-            if data is not None:
-                req = urllib.request.Request(url, data=data, method="POST",
-                                             headers={"User-Agent": UA, "Referer": XIUNEWS_BASE + "/",
-                                                      **({"Content-Type": content_type} if content_type else {})})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return _xiunews_decode(resp.read()), getattr(resp, "url", url) or url
-            raw = http_get_bytes(url, referer=XIUNEWS_BASE + "/", timeout=timeout)
-            return _xiunews_decode(raw), url
+                return resp.text, str(getattr(resp, "url", url) or url)
+            raw = http_get_bytes(url, headers=hdrs, referer=referer, timeout=timeout)
+            return raw.decode("utf-8", "ignore"), url
         except Exception as exc:
             last_exc = exc
-            # 超时 / 连接失败多半是会话或线路问题，重置会话后再试一次。
             _xiunews_reset_session()
             if attempt < retries:
-                time.sleep(0.6)
+                time.sleep(0.5)
     raise last_exc if last_exc else RuntimeError("xiunews fetch failed")
 
 
-def _xiunews_html(url: str, timeout: int = 15, retries: int = 2) -> str:
-    return _xiunews_fetch(url, timeout=timeout, retries=retries)[0]
-
-
-def _parse_xiunews_results(html: str, final_url: str, keyword: str) -> list[BookItem]:
-    """解析笔趣阁搜索结果页：每行含书名链接 /NN_NNNN/ 与作者。"""
-    soup = BeautifulSoup(html, "lxml")
-    items: list[BookItem] = []
-    seen: set[str] = set()
-    for a in soup.select('a[href*="_"]'):
-        href = a.get("href", "")
-        m = re.search(r"/(\d+_\d+)/?$", href)
-        if not m:
-            continue
-        bid = m.group(1)
-        title = a.get_text(strip=True)
-        if not title or bid in seen:
-            continue
-        seen.add(bid)
-        author = ""
-        row = a.find_parent("tr")
-        if row:
-            tds = row.find_all("td")
-            if len(tds) >= 3:
-                author = tds[2].get_text(strip=True)
-        items.append(
-            BookItem(source="xiunews", id=bid, title=title, author=author,
-                     url=f"{XIUNEWS_BASE}/{bid}/", kind="read")
-        )
-        if len(items) >= 30:
-            break
-    # 单一匹配时站点会 302 直接跳到书页（/NN_NNNN/），此时表格为空，从最终 url 兜底取书
-    if not items:
-        m = re.search(r"/(\d+_\d+)/?$", final_url or "")
-        if m:
-            bid = m.group(1)
-            h1 = soup.find("h1")
-            title = h1.get_text(strip=True) if h1 else keyword
-            ma = re.search(r"作者[:：]\s*([^<\s]+)", html)
-            author = ma.group(1).strip() if ma else ""
-            items.append(
-                BookItem(source="xiunews", id=bid, title=title, author=author,
-                         url=f"{XIUNEWS_BASE}/{bid}/", kind="read")
-            )
-    return items
-
-
-def _xiunews_cover(bid: str) -> str:
-    """抓取书页 og:image 作为封面（搜索结果页本身不含封面图）。"""
-    try:
-        html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/", timeout=8, retries=0)
-    except Exception:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-    img = soup.find("meta", property="og:image")
-    return img.get("content", "").strip() if img and img.get("content") else ""
-
-
-def enrich_xiunews_covers(items: list[BookItem], deadline: float = 9.0) -> None:
-    """并发补全笔趣阁搜索结果的封面（搜索页无图，需访问各书页取 og:image）。
-
-    尽力而为：受 deadline 约束，超时未取到的书保留空封面（前端回退到占位首字），
-    避免个别慢书页拖垮整个搜索请求。
-    """
-    pending = [it for it in items if not it.cover]
-    if not pending:
-        return
-    pool = ThreadPoolExecutor(max_workers=min(8, len(pending)))
-    try:
-        futures = {pool.submit(_xiunews_cover, it.id): it for it in pending}
-        try:
-            for future in as_completed(futures, timeout=deadline):
-                item = futures[future]
-                try:
-                    item.cover = future.result() or item.cover
-                except Exception:
-                    pass
-        except TimeoutError:
-            pass  # 超出整体期限，放弃尚未完成的封面抓取
-    finally:
-        pool.shutdown(wait=False)
-
-
-# 单源在 /api/book/search 聚合里的整体预算（见 f.result(timeout=...)）。
-XIUNEWS_BUDGET = 20.0
-
-
-SEARCH_PHP = XIUNEWS_BASE + "/modules/article/search.php"
-
-
-def _xiunews_search_once(keyword: str, method: str, charset: str, timeout: int) -> list[BookItem]:
-    """按指定 method/charset 跑一次站内搜索并解析结果。"""
-    kw = keyword.encode(charset, "ignore")
-    if method == "POST":
-        body = ("searchkey=" + urllib.parse.quote(kw)).encode("ascii")
-        html, final_url = _xiunews_fetch(
-            SEARCH_PHP, timeout=timeout, retries=0, data=body,
-            content_type=f"application/x-www-form-urlencoded; charset={charset}")
-    else:
-        url = f"{SEARCH_PHP}?searchkey={urllib.parse.quote(kw)}"
-        html, final_url = _xiunews_fetch(url, timeout=timeout, retries=0)
-    return _parse_xiunews_results(html, final_url, keyword)
-
-
-# 笔趣阁用的是 jieqi 引擎，不同部署/线路对 method+charset 的要求不一样，历史上每次只用
-# 一种方式、换一次就「又搜不到」。故按可靠性顺序依次尝试，取第一种能解析出结果的方式。
-# 顺序很关键：把当前线上可用且秒回的 GET+UTF-8 放最前，避免靠前的策略（如会被防火墙丢弃、
-# 必定连接超时的 POST）白白吃光超时预算，导致真正能出结果的策略没机会跑（=结果消失的根因）。
-XIUNEWS_STRATEGIES = [("GET", "utf-8"), ("GET", "gbk"), ("POST", "gbk")]
-
-
-def _xiunews_search_round(keyword: str, deadline: float) -> list[BookItem]:
-    """按 POST(GBK)→GET(GBK)→GET(UTF-8) 跑一轮，命中即返回。
-
-    关键：给每个策略**公平的超时切片**（按剩余预算在尚未尝试的策略间均分），避免靠前的
-    慢策略把预算吃光、让原本能出结果的回退策略根本没机会跑——这正是「结果又消失」的根因之一。
-    """
-    n = len(XIUNEWS_STRATEGIES)
-    attempts = 0
-    errors = 0
-    last_exc: Exception | None = None
-    for idx, (method, charset) in enumerate(XIUNEWS_STRATEGIES):
-        left = deadline - time.monotonic()
-        if left <= 2.0:
-            break
-        per = min(8.0, max(3.0, left / (n - idx)))  # 在剩余预算里公平均分，且 3s≤每次≤8s
-        per = min(per, left - 0.5)                   # 但绝不超出剩余预算
-        attempts += 1
-        try:
-            items = _xiunews_search_once(keyword, method, charset, timeout=int(per))
-        except Exception as exc:
-            errors += 1
-            last_exc = exc
-            items = []  # 该策略失败（超时/被拦/方法不被接受）：继续尝试下一种
-        if items:
-            return items
-    # 每个尝试过的策略都因网络错误（连接超时 / 被拒）失败、且没拿到任何响应：判定该源此刻
-    # 不可用，上抛异常让聚合层给出「打开原站搜索」入口，而不是悄悄返回空（与「200 空结果」区分）。
-    if attempts > 0 and errors == attempts:
-        raise SourceUnavailable(str(last_exc) if last_exc else "xiunews unavailable")
-    return []
+XIUNEWS_SEARCH_API = XIUNEWS_SEARCH_BASE + "/user/search.html"
 
 
 def search_xiunews(keyword: str) -> list[BookItem]:
-    start = time.monotonic()
-    deadline = start + min(18.0, XIUNEWS_BUDGET)
-    # 先预热一次（已缓存则无开销），免得预热的数秒开销算进第一个策略、把它挤超时。
-    _xiunews_warm_session()
+    """走移动站 JSON 搜索接口；失败 / 被反爬挡住时抛 SourceUnavailable，让聚合层给出原站入口。"""
+    q = urllib.parse.quote(keyword)
+    referer = f"{XIUNEWS_SEARCH_BASE}/s?q={q}"
     try:
-        items = _xiunews_search_round(keyword, deadline)
-    except SourceUnavailable:
-        # 站点拦截了本机 / 服务器 IP（连接超时）：重置会话以便下次重新预热，并上抛异常，
-        # 让聚合层把笔趣阁降级为「打开原站搜索」入口（而不是悄悄返回空）。
-        _xiunews_reset_session()
-        raise
-    if not items:
-        # 一轮全空多半是会话 cookie 失效被「200 空结果」软拦——重置会话，下次搜索会重新
-        # 预热拿新 cookie，避免「结果永久消失直到重启」。
-        _xiunews_reset_session()
-
-    # 封面补全只用「剩余预算」，绝不挤占出结果的时间：搜索慢时少补甚至不补，但结果照常返回。
-    remaining = XIUNEWS_BUDGET - (time.monotonic() - start)
-    if items and remaining >= 2.0:
-        try:
-            enrich_xiunews_covers(items, deadline=min(8.0, remaining))
-        except Exception:
-            pass  # 补封面失败绝不能影响搜索结果
+        text, _ = _xiunews_get(
+            f"{XIUNEWS_SEARCH_API}?q={q}", referer=referer, timeout=12, retries=1,
+            headers={"X-Requested-With": "XMLHttpRequest",
+                     "Accept": "application/json, text/javascript, */*; q=0.01"})
+    except Exception as exc:
+        raise SourceUnavailable(str(exc))
+    text = text.strip()
+    # 接口被反爬挡住时返回字面量 "1"（非 JSON）：视为暂不可用，交由聚合层降级为原站入口。
+    if not text or text == "1":
+        raise SourceUnavailable("search endpoint blocked")
+    try:
+        data = json.loads(text)
+    except Exception as exc:
+        raise SourceUnavailable(f"bad search json: {exc}")
+    if not isinstance(data, list):
+        return []
+    items: list[BookItem] = []
+    seen: set[str] = set()
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        m = re.search(r"/book/(\d+)/?", str(d.get("url_list", "")))
+        if not m:
+            continue
+        bid = m.group(1)
+        if bid in seen:
+            continue
+        seen.add(bid)
+        title = (d.get("articlename") or "").strip()
+        if not title:
+            continue
+        cover = (d.get("url_img") or "").strip()
+        if cover.startswith("//"):
+            cover = "https:" + cover
+        items.append(
+            BookItem(source="xiunews", id=bid, title=title,
+                     author=(d.get("author") or "").strip(), cover=cover,
+                     url=f"{XIUNEWS_BASE}/book/{bid}/", kind="read")
+        )
+        if len(items) >= 30:
+            break
     return items
 
 
 def detail_xiunews(bid: str) -> dict[str, Any]:
-    page = f"{XIUNEWS_BASE}/{bid}/"
-    # 站点偶发拦机房/本机 IP，首次请求常超时；重试时会重置并重新预热会话（拿新 cookie），
-    # 这正是让详情能稳定加载的关键。仅在重试耗尽后才由路由回退到「原站查看目录」。
-    html = _xiunews_html(page, timeout=12, retries=2)
+    page = f"{XIUNEWS_BASE}/book/{bid}/"
+    html, _ = _xiunews_get(page, referer=XIUNEWS_BASE + "/", timeout=12, retries=2)
     soup = BeautifulSoup(html, "lxml")
-    title = ""
     h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(strip=True)
-    author = ""
+    title = h1.get_text(strip=True) if h1 else ""
     ma = re.search(r"作者[:：]\s*([^<\s]+)", html)
-    if ma:
-        author = ma.group(1).strip()
+    author = ma.group(1).strip() if ma else ""
     img = soup.find("meta", property="og:image")
-    cover = img.get("content", "").strip() if img else ""
+    cover = img.get("content", "").strip() if img and img.get("content") else ""
     desc = ""
     dm = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
     if dm:
         desc = dm.get("content", "").strip()
     chapters: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for a in soup.select("dd a, .listmain a, #list a"):
-        href = a.get("href", "")
-        m = re.search(rf"/{re.escape(bid)}/(\d+)\.html", href)
+    # 章节列表在 .listmain 容器内，避免误抓导航 / 推荐里的书页链接。
+    container = soup.select_one(".listmain") or soup
+    for a in container.select("a[href]"):
+        m = re.search(rf"/book/{re.escape(bid)}/(\d+)\.html", a.get("href", ""))
         if not m:
             continue
         cid = m.group(1)
         if cid in seen:
             continue
         seen.add(cid)
-        chapters.append({"id": cid, "name": a.get_text(strip=True), "url": f"{XIUNEWS_BASE}/{bid}/{cid}.html"})
+        chapters.append({"id": cid, "name": a.get_text(strip=True),
+                         "url": f"{XIUNEWS_BASE}/book/{bid}/{cid}.html"})
     return {
         "source": "xiunews",
         "id": bid,
@@ -1619,29 +1473,41 @@ def detail_xiunews(bid: str) -> dict[str, Any]:
         "desc": desc[:600],
         "pageUrl": page,
         "kind": "read",
+        # 正文有反爬，无法服务端整本打包；前端据此隐藏「下载 TXT」。
+        "downloadable": False,
+        "readNote": "本站章节正文有反爬保护，点击章节会跳转到原站阅读。",
         "chapters": chapters,
     }
 
 
+class XiunewsReadingGated(Exception):
+    """章节正文被站点 JS 验证拦截，需在原站（浏览器）阅读。"""
+
+
 def _xiunews_chapter_text(bid: str, cid: str) -> tuple[str, list[str]]:
-    # 章节页允许一次重试（重置会话后再试），抓起偶发超时；仍耗尽才回退到「重试本章 / 原站阅读」。
-    html = _xiunews_html(f"{XIUNEWS_BASE}/{bid}/{cid}.html", timeout=12, retries=1)
+    url = f"{XIUNEWS_BASE}/book/{bid}/{cid}.html"
+    html, final = _xiunews_get(url, referer=f"{XIUNEWS_BASE}/book/{bid}/", timeout=12, retries=1)
+    # 命中验证跳转页（标题「加载中」/ 跳到 verify、userverify / 页面极短）：判为需原站阅读。
+    if "verify" in final or "/userverify" in final or len(html) < 1500:
+        raise XiunewsReadingGated(url)
     soup = BeautifulSoup(html, "lxml")
-    name = ""
+    content_el = (soup.find(id="chaptercontent") or soup.find(id="content")
+                  or soup.find("div", id=re.compile(r"content|booktext|nr", re.I))
+                  or soup.find("div", class_=re.compile(r"content|showtxt|read")))
+    if content_el is None:
+        raise XiunewsReadingGated(url)
     h1 = soup.find("h1")
-    if h1:
-        name = h1.get_text(strip=True)
-    content_el = soup.find(id="content") or soup.find("div", class_=re.compile(r"content|showtxt"))
+    name = h1.get_text(strip=True) if h1 else ""
+    for tag in content_el.find_all(["script", "style", "div", "a"]):
+        tag.decompose()
     paras: list[str] = []
-    if content_el:
-        for tag in content_el.find_all(["script", "style", "div", "a"]):
-            tag.decompose()
-        raw = content_el.get_text("\n", strip=True)
-        for line in raw.split("\n"):
-            line = line.strip()
-            if not line or "笔趣" in line and "http" in line:
-                continue
-            paras.append(line)
+    for line in content_el.get_text("\n", strip=True).split("\n"):
+        line = line.strip()
+        if not line or ("笔趣" in line and "http" in line):
+            continue
+        paras.append(line)
+    if not paras:
+        raise XiunewsReadingGated(url)
     return name, paras
 
 
@@ -1734,8 +1600,8 @@ def api_book_detail():
         text = str(exc).lower()
         if source == "xiunews" and ("timed out" in text or "curl: (28)" in text or "timeout" in text):
             msg = "详情加载超时：笔趣阁偶发拦截服务器/本机 IP。可重试，或点下方按钮在原站查看目录。"
-            return jsonify({"error": msg, "pageUrl": f"{XIUNEWS_BASE}/{bid}/"}), 502
-        page_url = f"{XIUNEWS_BASE}/{bid}/" if source == "xiunews" else ""
+            return jsonify({"error": msg, "pageUrl": f"{XIUNEWS_BASE}/book/{bid}/"}), 502
+        page_url = f"{XIUNEWS_BASE}/book/{bid}/" if source == "xiunews" else ""
         return jsonify({"error": f"详情加载失败：{exc}", "pageUrl": page_url}), 500
 
 
@@ -1748,13 +1614,16 @@ def api_book_chapter():
         return jsonify({"error": f"该来源不支持站内阅读: {source}"}), 400
     if not book or not cid:
         return jsonify({"error": "缺少 book 或 id"}), 400
-    chapter_url = f"{XIUNEWS_BASE}/{book}/{cid}.html"
+    chapter_url = f"{XIUNEWS_BASE}/book/{book}/{cid}.html"
     try:
         return jsonify(chapter_xiunews(book, cid))
+    except XiunewsReadingGated:
+        msg = "本章正文有反爬保护，无法在站内显示。点下方按钮可在原站（浏览器）阅读本章。"
+        return jsonify({"error": msg, "chapterUrl": chapter_url}), 502
     except Exception as exc:
         text = str(exc).lower()
         if "timed out" in text or "curl: (28)" in text or "timeout" in text:
-            msg = "章节加载超时：笔趣阁偶发拦截服务器/本机 IP。可重试，或点下方按钮在原站阅读本章。"
+            msg = "章节加载超时：可重试，或点下方按钮在原站阅读本章。"
         else:
             msg = f"章节加载失败：{exc}"
         return jsonify({"error": msg, "chapterUrl": chapter_url}), 502
@@ -1762,92 +1631,56 @@ def api_book_chapter():
 
 @app.get("/api/book/download")
 def api_book_download():
-    """笔趣阁整本下载：并发抓取各章节文本，拼成 TXT 返回。"""
+    """整本 TXT 下载：新笔趣阁章节正文有反爬保护，服务端无法稳定打包，故引导到原站阅读。"""
     source = (request.args.get("source") or "").lower()
     book = (request.args.get("id") or "").strip()
     if source != "xiunews":
         return jsonify({"error": "该来源请使用原站下载入口"}), 400
     if not book:
         return jsonify({"error": "缺少 id"}), 400
-    try:
-        detail = detail_xiunews(book)
-    except Exception as exc:
-        return jsonify({"error": f"获取目录失败: {exc}"}), 502
-    chapters = detail.get("chapters", [])
-    if not chapters:
-        return jsonify({"error": "未找到章节目录"}), 404
-
-    title = detail.get("title") or book
-    author = detail.get("author") or ""
-
-    def fetch(ch: dict[str, Any]) -> tuple[str, str]:
-        try:
-            name, paras = _xiunews_chapter_text(book, ch["id"])
-            return ch["id"], (name or ch["name"]) + "\n\n" + "\n".join(paras) + "\n\n"
-        except Exception:
-            return ch["id"], (ch["name"] or "") + "\n\n（本章加载失败）\n\n"
-
-    order = [c["id"] for c in chapters]
-    texts: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(fetch, c): c["id"] for c in chapters}
-        for fut in as_completed(futs):
-            cid, body = fut.result()
-            texts[cid] = body
-
-    def generate() -> Iterator[bytes]:
-        header = f"{title}\n作者：{author}\n来源：笔趣阁 {XIUNEWS_BASE}/{book}/\n\n"
-        yield header.encode("utf-8")
-        for cid in order:
-            yield texts.get(cid, "").encode("utf-8")
-
-    filename = sanitize_filename(f"{title}-{author}".strip("-")) + ".txt"
-    quoted = urllib.parse.quote(filename)
-    headers = {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Content-Disposition": f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}",
-    }
-    return Response(generate(), headers=headers)
+    return jsonify({
+        "error": "本站章节正文有反爬保护，暂不支持整本下载。请点「打开原站页面」在浏览器中阅读。",
+        "pageUrl": f"{XIUNEWS_BASE}/book/{book}/",
+    }), 400
 
 
 @app.get("/api/book/xiunews_diag")
 def api_book_xiunews_diag():
-    """临时诊断：在「你的网络」上把每种 method×charset 各跑一次站内搜索，
-    返回每种方式的耗时/解析行数/书页链接数/示例书目，用于定位「搜索结果消失」。
-    用法：浏览器打开 /api/book/xiunews_diag?kw=斗破苍穹 ，把返回的 JSON 贴给开发者。
+    """诊断：在「你的网络」上跑一次新笔趣阁 3bqg 搜索 + 一次书页抓取，
+    返回搜索结果数 / 示例书目 / 书页可达性，用于定位「搜不到结果」。
+    用法：浏览器打开 /api/book/xiunews_diag?kw=斗破苍穹 ，把返回 JSON 贴给开发者。
     """
     kw = (request.args.get("kw") or "斗破苍穹").strip()
-    # 与真实搜索一致：先预热带 cookie 的会话
-    _xiunews_warm_session()
-    results: list[dict[str, Any]] = []
-    for method in ("POST", "GET"):
-        for charset in ("gbk", "utf-8"):
-            rec: dict[str, Any] = {"method": method, "charset": charset}
-            t0 = time.monotonic()
-            try:
-                kwb = kw.encode(charset, "ignore")
-                if method == "POST":
-                    body = ("searchkey=" + urllib.parse.quote(kwb)).encode("ascii")
-                    html, final_url = _xiunews_fetch(
-                        SEARCH_PHP, timeout=12, retries=0, data=body,
-                        content_type=f"application/x-www-form-urlencoded; charset={charset}")
-                else:
-                    url = f"{SEARCH_PHP}?searchkey={urllib.parse.quote(kwb)}"
-                    html, final_url = _xiunews_fetch(url, timeout=12, retries=0)
-                items = _parse_xiunews_results(html, final_url, kw)
-                rec.update({
-                    "ok": True,
-                    "rows": len(items),
-                    "final_url": final_url,
-                    "html_len": len(html),
-                    "book_links": len(re.findall(r"/\d+_\d+/", html)),
-                    "sample": [{"id": it.id, "title": it.title, "author": it.author} for it in items[:5]],
-                })
-            except Exception as exc:
-                rec.update({"ok": False, "error": str(exc)})
-            rec["ms"] = int((time.monotonic() - t0) * 1000)
-            results.append(rec)
-    return jsonify({"kw": kw, "has_cffi": HAS_CFFI, "search_php": SEARCH_PHP, "results": results})
+    out: dict[str, Any] = {
+        "kw": kw, "has_cffi": HAS_CFFI,
+        "search_api": XIUNEWS_SEARCH_API, "book_base": XIUNEWS_BASE,
+    }
+    # 1) 搜索接口
+    t0 = time.monotonic()
+    try:
+        items = search_xiunews(kw)
+        out["search"] = {
+            "ok": True, "ms": int((time.monotonic() - t0) * 1000), "rows": len(items),
+            "sample": [{"id": it.id, "title": it.title, "author": it.author} for it in items[:5]],
+        }
+    except Exception as exc:
+        out["search"] = {"ok": False, "ms": int((time.monotonic() - t0) * 1000), "error": str(exc)}
+    # 2) 书页 / 目录抓取（用搜索到的第一本，否则用一个已知书号）
+    bid = None
+    if out["search"].get("ok") and out["search"].get("sample"):
+        bid = out["search"]["sample"][0]["id"]
+    if bid:
+        t1 = time.monotonic()
+        try:
+            d = detail_xiunews(bid)
+            out["detail"] = {
+                "ok": True, "ms": int((time.monotonic() - t1) * 1000), "id": bid,
+                "title": d.get("title"), "author": d.get("author"),
+                "chapters": len(d.get("chapters", [])), "has_cover": bool(d.get("cover")),
+            }
+        except Exception as exc:
+            out["detail"] = {"ok": False, "ms": int((time.monotonic() - t1) * 1000), "error": str(exc)}
+    return jsonify(out)
 
 
 if __name__ == "__main__":
